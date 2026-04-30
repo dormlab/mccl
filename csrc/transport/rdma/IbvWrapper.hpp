@@ -2,7 +2,7 @@
 
 #include "transport/rdma/ibverbs_compat.h"
 
-namespace mccl {
+namespace distro {
 
 struct IbvFunctions {
     ibv_device** (*get_device_list)(int* num_devices);
@@ -36,4 +36,4 @@ const IbvFunctions* ibv();
 /// Quick availability check (calls ibv() internally).
 bool ibv_is_available();
 
-} // namespace mccl
+} // namespace distro

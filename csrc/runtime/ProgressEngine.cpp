@@ -5,11 +5,11 @@
 
 #include <utility>
 
-namespace mccl {
+namespace distro {
 
 ProgressEngine::ProgressEngine(size_t max_queue_depth, Metrics* metrics)
     : max_depth_(max_queue_depth), metrics_(metrics) {
-    MCCL_CHECK(max_depth_ > 0, "max_queue_depth must be > 0");
+    DISTRO_CHECK(max_depth_ > 0, "max_queue_depth must be > 0");
 }
 
 ProgressEngine::~ProgressEngine() {
@@ -24,16 +24,16 @@ void ProgressEngine::start() {
     thread_ = std::thread(&ProgressEngine::worker_loop, this);
 
 #if defined(__APPLE__)
-    pthread_setname_np("mccl_engine");
+    pthread_setname_np("distro_engine");
 #endif
 
-    MCCL_INFO("ProgressEngine started (max_depth=%zu)", max_depth_);
+    DISTRO_INFO("ProgressEngine started (max_depth=%zu)", max_depth_);
 }
 
 uint32_t ProgressEngine::submit(std::function<void()> execute,
                                 std::function<void()> on_complete,
                                 std::function<void(std::exception_ptr)> on_error) {
-    MCCL_CHECK(running_.load(), "ProgressEngine is not running");
+    DISTRO_CHECK(running_.load(), "ProgressEngine is not running");
 
     uint32_t seq = seq_counter_.fetch_add(1);
 
@@ -57,14 +57,14 @@ uint32_t ProgressEngine::submit(std::function<void()> execute,
     }
     not_empty_.notify_one();
 
-    MCCL_TRACE("Submitted op seq=%u (queue_depth=%zu)", seq, queue_depth());
+    DISTRO_TRACE("Submitted op seq=%u (queue_depth=%zu)", seq, queue_depth());
     return seq;
 }
 
 void ProgressEngine::stop() {
     if (!running_.load()) return;
 
-    MCCL_INFO("ProgressEngine stopping...");
+    DISTRO_INFO("ProgressEngine stopping...");
 
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -78,7 +78,7 @@ void ProgressEngine::stop() {
     }
     running_ = false;
 
-    MCCL_INFO("ProgressEngine stopped");
+    DISTRO_INFO("ProgressEngine stopped");
 }
 
 size_t ProgressEngine::queue_depth() const {
@@ -87,7 +87,7 @@ size_t ProgressEngine::queue_depth() const {
 }
 
 void ProgressEngine::worker_loop() {
-    MCCL_DEBUG("ProgressEngine worker thread started");
+    DISTRO_DEBUG("ProgressEngine worker thread started");
 
     while (true) {
         EngineOp op;
@@ -109,7 +109,7 @@ void ProgressEngine::worker_loop() {
         }
         not_full_.notify_one();
 
-        MCCL_TRACE("Executing op seq=%u", op.seq_num);
+        DISTRO_TRACE("Executing op seq=%u", op.seq_num);
 
         // Record when execution actually starts (after queue wait)
         if (metrics_) {
@@ -123,23 +123,23 @@ void ProgressEngine::worker_loop() {
             exec_ok = true;
         } catch (...) {
             exec_ex = std::current_exception();
-            MCCL_ERROR("Op seq=%u execute() failed with exception", op.seq_num);
+            DISTRO_ERROR("Op seq=%u execute() failed with exception", op.seq_num);
         }
 
         if (exec_ok) {
             std::exception_ptr complete_ex;
             try {
                 if (op.on_complete) op.on_complete();
-                MCCL_TRACE("Op seq=%u completed", op.seq_num);
+                DISTRO_TRACE("Op seq=%u completed", op.seq_num);
             } catch (...) {
                 complete_ex = std::current_exception();
-                MCCL_ERROR("Op seq=%u on_complete() threw — routing to on_error", op.seq_num);
+                DISTRO_ERROR("Op seq=%u on_complete() threw — routing to on_error", op.seq_num);
             }
             if (complete_ex) {
                 try {
                     if (op.on_error) op.on_error(complete_ex);
                 } catch (...) {
-                    MCCL_ERROR("Op seq=%u on_error() also threw after on_complete() failure", op.seq_num);
+                    DISTRO_ERROR("Op seq=%u on_error() also threw after on_complete() failure", op.seq_num);
                 }
             }
         } else {
@@ -148,12 +148,12 @@ void ProgressEngine::worker_loop() {
                     op.on_error(exec_ex);
                 }
             } catch (...) {
-                MCCL_ERROR("Op seq=%u on_error() threw (swallowing to keep engine alive)", op.seq_num);
+                DISTRO_ERROR("Op seq=%u on_error() threw (swallowing to keep engine alive)", op.seq_num);
             }
         }
     }
 
-    MCCL_DEBUG("ProgressEngine worker thread exiting");
+    DISTRO_DEBUG("ProgressEngine worker thread exiting");
 }
 
-} // namespace mccl
+} // namespace distro

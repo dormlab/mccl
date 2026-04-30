@@ -6,7 +6,7 @@
 #include <cstring>
 #include <vector>
 
-namespace mccl {
+namespace distro {
 
 struct IbvFunctions;
 
@@ -74,6 +74,29 @@ public:
     /// Post a receive work request.
     bool post_recv(ibv_sge& sge, uint64_t wr_id);
 
+    // ── One-sided RDMA operations ──────────────────────────────────
+
+    /// RDMA write: write local data directly to remote memory.
+    /// Requires remote rkey from the peer's memory registration.
+    bool post_rdma_write(ibv_sge& sge, uint64_t remote_addr,
+                         uint32_t rkey, uint64_t wr_id,
+                         bool signaled = true);
+
+    /// RDMA read: read remote data directly into local memory.
+    bool post_rdma_read(ibv_sge& sge, uint64_t remote_addr,
+                        uint32_t rkey, uint64_t wr_id,
+                        bool signaled = true);
+
+    /// RDMA write with immediate: write + deliver 32-bit value to remote CQ.
+    /// Used for coherence protocol messages (opcode in imm_data).
+    bool post_rdma_write_with_imm(ibv_sge& sge, uint64_t remote_addr,
+                                  uint32_t rkey, uint32_t imm_data,
+                                  uint64_t wr_id);
+
+    /// RDMA fence: ensures all prior RDMA ops to this QP complete before
+    /// subsequent ones begin. Used for coherence ordering.
+    bool post_fence(uint64_t wr_id);
+
     /// Poll the CQ for up to max_wc completions. Returns count (≥0),
     /// or -1 on error.
     int poll(int max_wc, ibv_wc* wc_out);
@@ -92,4 +115,4 @@ private:
     ibv_qp*      qp_  = nullptr;
 };
 
-} // namespace mccl
+} // namespace distro

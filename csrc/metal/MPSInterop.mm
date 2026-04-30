@@ -18,19 +18,19 @@ namespace at::mps {
     }
 }
 
-namespace mccl {
+namespace distro {
 
 namespace {
 
 id<MTLDevice> cached_device() {
     static id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    MCCL_CHECK(dev != nil, "No Metal device available");
+    DISTRO_CHECK(dev != nil, "No Metal device available");
     return dev;
 }
 
 id<MTLCommandQueue> cached_queue() {
     static id<MTLCommandQueue> q = [cached_device() newCommandQueue];
-    MCCL_CHECK(q != nil, "Failed to create MTLCommandQueue");
+    DISTRO_CHECK(q != nil, "Failed to create MTLCommandQueue");
     return q;
 }
 
@@ -56,7 +56,7 @@ struct StagingPool {
 
             capacity = (nbytes + PAGE - 1) & ~(PAGE - 1);
             int rc = posix_memalign(&ptr, PAGE, capacity);
-            MCCL_CHECK(rc == 0 && ptr != nullptr, "Staging buffer allocation failed");
+            DISTRO_CHECK(rc == 0 && ptr != nullptr, "Staging buffer allocation failed");
 
             size_t max_buf = metal_max_buffer_len();
             if (capacity <= max_buf) {
@@ -64,12 +64,12 @@ struct StagingPool {
                                                        length:capacity
                                                       options:MTLResourceStorageModeShared
                                                   deallocator:nil];
-                MCCL_CHECK(mtl_wrapper != nil, "Staging MTLBuffer creation failed");
+                DISTRO_CHECK(mtl_wrapper != nil, "Staging MTLBuffer creation failed");
             } else {
-                MCCL_INFO("Staging pool %zu bytes exceeds maxBufferLength %zu; using chunked blits",
+                DISTRO_INFO("Staging pool %zu bytes exceeds maxBufferLength %zu; using chunked blits",
                           capacity, max_buf);
             }
-            MCCL_DEBUG("Staging pool resized to %zu bytes (page-aligned)", capacity);
+            DISTRO_DEBUG("Staging pool resized to %zu bytes (page-aligned)", capacity);
         }
         return ptr;
     }
@@ -90,11 +90,11 @@ StagingPool& staging_pool() {
 void check_command_buffer(id<MTLCommandBuffer> cmd, const char* context) {
     if (cmd.status == MTLCommandBufferStatusError) {
         NSError* err = cmd.error;
-        MCCL_ERROR("%s: Metal command buffer error: %s (code %ld)",
+        DISTRO_ERROR("%s: Metal command buffer error: %s (code %ld)",
                    context,
                    err ? [[err localizedDescription] UTF8String] : "unknown",
                    err ? (long)err.code : -1);
-        MCCL_CHECK(false, std::string(context) + ": Metal command buffer failed");
+        DISTRO_CHECK(false, std::string(context) + ": Metal command buffer failed");
     }
 }
 
@@ -120,7 +120,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
     size_t offset = 0;
     uint8_t* dst_bytes = static_cast<uint8_t*>(dst);
 
-    MCCL_INFO("chunked_blit_to_staging: %zu bytes in chunks of %zu (maxBuf=%zu)",
+    DISTRO_INFO("chunked_blit_to_staging: %zu bytes in chunks of %zu (maxBuf=%zu)",
               nbytes, max_chunk, max_chunk);
 
     while (offset < nbytes) {
@@ -133,7 +133,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                 length:aligned_chunk
                 options:MTLResourceStorageModeShared
                 deallocator:nil];
-            MCCL_CHECK(chunk_mtl != nil,
+            DISTRO_CHECK(chunk_mtl != nil,
                        "chunked_blit_to_staging: MTLBuffer wrap failed at offset " +
                        std::to_string(offset) + " chunk=" + std::to_string(aligned_chunk));
 
@@ -184,7 +184,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
                 length:aligned_chunk
                 options:MTLResourceStorageModeShared
                 deallocator:nil];
-            MCCL_CHECK(chunk_mtl != nil,
+            DISTRO_CHECK(chunk_mtl != nil,
                        "chunked_blit_from_staging: MTLBuffer wrap failed at offset " +
                        std::to_string(offset));
 
@@ -223,12 +223,12 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor) {
 
     void* ptr = nullptr;
     int rc = posix_memalign(&ptr, PAGE, alloc_size);
-    MCCL_CHECK(rc == 0 && ptr != nullptr,
+    DISTRO_CHECK(rc == 0 && ptr != nullptr,
                "ensure_shared_storage: posix_memalign failed for " + std::to_string(alloc_size) + " bytes");
 
     chunked_blit_to_staging(src_buf, src_offset, ptr, nbytes);
 
-    MCCL_DEBUG("ensure_shared_storage: blit %zu bytes from private to shared", nbytes);
+    DISTRO_DEBUG("ensure_shared_storage: blit %zu bytes from private to shared", nbytes);
 
     auto deleter = [](void* p) { free(p); };
     auto storage = c10::Storage(
@@ -245,13 +245,13 @@ void* get_mtl_device() {
     return (__bridge void*)cached_device();
 }
 
-void* get_mccl_command_queue() {
+void* get_distro_command_queue() {
     return (__bridge void*)cached_queue();
 }
 
 MPSBufferView wrap_cpu_tensor_as_mps_buffer(const at::Tensor& tensor) {
-    MCCL_CHECK(tensor.is_cpu(), "wrap_cpu_tensor_as_mps_buffer requires CPU tensor");
-    MCCL_CHECK(tensor.is_contiguous(), "CPU tensor must be contiguous");
+    DISTRO_CHECK(tensor.is_cpu(), "wrap_cpu_tensor_as_mps_buffer requires CPU tensor");
+    DISTRO_CHECK(tensor.is_contiguous(), "CPU tensor must be contiguous");
     
     void* data_ptr = tensor.data_ptr();
     size_t nbytes = tensor_nbytes(tensor);
@@ -261,9 +261,9 @@ MPSBufferView wrap_cpu_tensor_as_mps_buffer(const at::Tensor& tensor) {
                                                       length:nbytes
                                                      options:MTLResourceStorageModeShared
                                                  deallocator:nil];
-    MCCL_CHECK(buffer != nil, "Failed to wrap CPU tensor as MTLBuffer");
+    DISTRO_CHECK(buffer != nil, "Failed to wrap CPU tensor as MTLBuffer");
     
-    MCCL_TRACE("wrap_cpu_tensor: data_ptr=%p nbytes=%zu", data_ptr, nbytes);
+    DISTRO_TRACE("wrap_cpu_tensor: data_ptr=%p nbytes=%zu", data_ptr, nbytes);
     
     return MPSBufferView{
         .mtl_buffer     = (__bridge void*)buffer,
@@ -282,7 +282,7 @@ MPSBufferView extract_mps_buffer(const at::Tensor& tensor) {
     }
 
     id<MTLBuffer> buffer = at::mps::getMTLBufferStorage(tensor);
-    MCCL_CHECK(buffer != nil, "getMTLBufferStorage returned nil");
+    DISTRO_CHECK(buffer != nil, "getMTLBufferStorage returned nil");
 
     size_t storage_offset_bytes =
         static_cast<size_t>(tensor.storage_offset()) * tensor.element_size();
@@ -292,7 +292,7 @@ MPSBufferView extract_mps_buffer(const at::Tensor& tensor) {
     bool cpu_ok = (buffer.storageMode == MTLStorageModeShared);
     void* cpu_ptr = cpu_ok ? (static_cast<uint8_t*>(buffer.contents) + storage_offset_bytes) : nullptr;
 
-    MCCL_TRACE("extract_mps_buffer: offset=%zu nbytes=%zu cpu_ok=%d",
+    DISTRO_TRACE("extract_mps_buffer: offset=%zu nbytes=%zu cpu_ok=%d",
                storage_offset_bytes, nbytes, (int)cpu_ok);
 
     return MPSBufferView{
@@ -308,7 +308,7 @@ void mps_stream_sync() {
     torch::mps::synchronize();
 }
 
-void mccl_queue_drain() {
+void distro_queue_drain() {
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
         [cmd commit];
@@ -318,15 +318,15 @@ void mccl_queue_drain() {
 
 void mps_sync() {
     mps_stream_sync();
-    mccl_queue_drain();
+    distro_queue_drain();
 }
 
 uint64_t mps_event_sync_nonblocking() {
     static const bool force_stream_sync = [] {
-        auto* v = std::getenv("MCCL_EVENT_SYNC");
+        auto* v = std::getenv("DISTRO_EVENT_SYNC");
         if (v && (std::string(v) == "0" || std::string(v) == "false" ||
                   std::string(v) == "no")) {
-            MCCL_WARN("MCCL_EVENT_SYNC=0: MTLSharedEvent path disabled, "
+            DISTRO_WARN("DISTRO_EVENT_SYNC=0: MTLSharedEvent path disabled, "
                        "falling back to mps_stream_sync");
             return true;
         }
@@ -354,16 +354,16 @@ StagingBuffer stage_for_send(const at::Tensor& tensor) {
     check_single_tensor(tensor);
 
     mps_stream_sync();
-    mccl_queue_drain();
+    distro_queue_drain();
 
     MPSBufferView view = extract_mps_buffer(tensor);
 
     if (view.cpu_accessible && view.cpu_ptr) {
-        MCCL_TRACE("stage_for_send: direct CPU path, %zu bytes", view.nbytes);
+        DISTRO_TRACE("stage_for_send: direct CPU path, %zu bytes", view.nbytes);
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
-    MCCL_DEBUG("stage_for_send: blit fallback for %zu bytes", view.nbytes);
+    DISTRO_DEBUG("stage_for_send: blit fallback for %zu bytes", view.nbytes);
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
@@ -379,11 +379,11 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor) {
     MPSBufferView view = extract_mps_buffer(tensor);
 
     if (view.cpu_accessible && view.cpu_ptr) {
-        MCCL_TRACE("stage_for_send_nosync: direct CPU path, %zu bytes", view.nbytes);
+        DISTRO_TRACE("stage_for_send_nosync: direct CPU path, %zu bytes", view.nbytes);
         return StagingBuffer{view.cpu_ptr, view.nbytes};
     }
 
-    MCCL_DEBUG("stage_for_send_nosync: blit fallback for %zu bytes", view.nbytes);
+    DISTRO_DEBUG("stage_for_send_nosync: blit fallback for %zu bytes", view.nbytes);
 
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
     StagingPool& pool = staging_pool();
@@ -395,18 +395,18 @@ StagingBuffer stage_for_send_nosync(const at::Tensor& tensor) {
 
 void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes) {
     check_single_tensor(tensor);
-    MCCL_CHECK(nbytes == tensor_nbytes(tensor),
+    DISTRO_CHECK(nbytes == tensor_nbytes(tensor),
                "unstage size mismatch");
 
     MPSBufferView view = extract_mps_buffer(tensor);
 
     if (view.cpu_accessible && view.cpu_ptr) {
-        MCCL_TRACE("unstage_from_recv: direct memcpy path, %zu bytes", nbytes);
+        DISTRO_TRACE("unstage_from_recv: direct memcpy path, %zu bytes", nbytes);
         memcpy(view.cpu_ptr, src, nbytes);
         return;
     }
 
-    MCCL_DEBUG("unstage_from_recv: blit fallback for %zu bytes", nbytes);
+    DISTRO_DEBUG("unstage_from_recv: blit fallback for %zu bytes", nbytes);
 
     id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
 
@@ -422,4 +422,4 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
     chunked_blit_from_staging(blit_src, nbytes, dst_buf, view.byte_offset);
 }
 
-} // namespace mccl
+} // namespace distro

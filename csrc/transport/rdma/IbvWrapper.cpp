@@ -4,7 +4,7 @@
 #include <dlfcn.h>
 #include <mutex>
 
-namespace mccl {
+namespace distro {
 
 namespace {
 
@@ -12,7 +12,7 @@ template <typename T>
 bool load_sym(void* handle, const char* name, T& out) {
     out = reinterpret_cast<T>(dlsym(handle, name));
     if (!out) {
-        MCCL_DEBUG("IbvWrapper: dlsym(%s) failed: %s", name, dlerror());
+        DISTRO_DEBUG("IbvWrapper: dlsym(%s) failed: %s", name, dlerror());
         return false;
     }
     return true;
@@ -33,7 +33,7 @@ bool try_load() {
 
     g_state.lib_handle = dlopen("librdma.dylib", RTLD_NOW);
     if (!g_state.lib_handle) {
-        MCCL_INFO("IbvWrapper: dlopen(librdma.dylib) failed: %s", dlerror());
+        DISTRO_INFO("IbvWrapper: dlopen(librdma.dylib) failed: %s", dlerror());
         return false;
     }
 
@@ -59,7 +59,7 @@ bool try_load() {
     ok = ok && load_sym(g_state.lib_handle, "ibv_query_gid",        f.query_gid);
 
     if (!ok) {
-        MCCL_WARN("IbvWrapper: some ibv symbols missing — RDMA disabled");
+        DISTRO_WARN("IbvWrapper: some ibv symbols missing — RDMA disabled");
         dlclose(g_state.lib_handle);
         g_state.lib_handle = nullptr;
         return false;
@@ -68,7 +68,7 @@ bool try_load() {
     int num_devices = 0;
     ibv_device** dev_list = f.get_device_list(&num_devices);
     if (!dev_list || num_devices == 0) {
-        MCCL_INFO("IbvWrapper: librdma loaded but no RDMA devices found");
+        DISTRO_INFO("IbvWrapper: librdma loaded but no RDMA devices found");
         if (dev_list) f.free_device_list(dev_list);
         dlclose(g_state.lib_handle);
         g_state.lib_handle = nullptr;
@@ -76,7 +76,7 @@ bool try_load() {
     }
     f.free_device_list(dev_list);
 
-    MCCL_INFO("IbvWrapper: librdma.dylib loaded — %d device(s) available", num_devices);
+    DISTRO_INFO("IbvWrapper: librdma.dylib loaded — %d device(s) available", num_devices);
     return true;
 }
 
@@ -95,4 +95,4 @@ bool ibv_is_available() {
     return ibv() != nullptr;
 }
 
-} // namespace mccl
+} // namespace distro

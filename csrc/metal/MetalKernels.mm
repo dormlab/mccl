@@ -7,13 +7,12 @@
 
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
-#include "metal/AccelerateOps.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
 #include <c10d/Types.hpp>
 
-namespace mccl {
+namespace distro {
 
 namespace {
 
@@ -56,18 +55,18 @@ id<MTLComputePipelineState> make_pipeline(id<MTLDevice> dev,
                                            NSString* name) {
     NSError* err = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:name];
-    MCCL_CHECK(fn != nil,
+    DISTRO_CHECK(fn != nil,
                "Metal function not found: " +
                std::string([name UTF8String]));
 
     id<MTLComputePipelineState> pso =
         [dev newComputePipelineStateWithFunction:fn error:&err];
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "Pipeline creation failed for " +
                std::string([name UTF8String]) + ": " +
                std::string(err ? [[err localizedDescription] UTF8String] : "unknown error"));
 
-    MCCL_DEBUG("Pipeline %s: threadExecutionWidth=%lu maxThreads=%lu",
+    DISTRO_DEBUG("Pipeline %s: threadExecutionWidth=%lu maxThreads=%lu",
                [name UTF8String],
                (unsigned long)pso.threadExecutionWidth,
                (unsigned long)pso.maxTotalThreadsPerThreadgroup);
@@ -79,14 +78,14 @@ id<MTLComputePipelineState> make_pipeline_if_present(id<MTLDevice> dev,
                                                      NSString* name) {
     id<MTLFunction> fn = [lib newFunctionWithName:name];
     if (fn == nil) {
-        MCCL_DEBUG("Optional Metal function unavailable: %s", [name UTF8String]);
+        DISTRO_DEBUG("Optional Metal function unavailable: %s", [name UTF8String]);
         return nil;
     }
 
     NSError* err = nil;
     id<MTLComputePipelineState> pso =
         [dev newComputePipelineStateWithFunction:fn error:&err];
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "Pipeline creation failed for " +
                std::string([name UTF8String]) + ": " +
                std::string(err ? [[err localizedDescription] UTF8String] : "unknown error"));
@@ -113,20 +112,10 @@ DispatchParams compute_dispatch(id<MTLComputePipelineState> pso, uint64_t elemen
 }
 
 bool metal_fast_math_enabled() {
-    const char* v = std::getenv("MCCL_FAST_MATH");
+    const char* v = std::getenv("DISTRO_FAST_MATH");
     if (!v) return true;
     std::string s(v);
     return !(s == "0" || s == "false" || s == "FALSE");
-}
-
-uint32_t small_gpu_threshold() {
-    static const uint32_t cached = []() -> uint32_t {
-        const char* v = std::getenv("MCCL_GPU_THRESHOLD");
-        if (!v) return 4096;
-        long long parsed = std::atoll(v);
-        return static_cast<uint32_t>(std::max<long long>(0, parsed));
-    }();
-    return cached;
 }
 
 bool is_vector_aligned(const MPSBufferView& view, at::ScalarType dtype) {
@@ -150,17 +139,6 @@ bool binary_vector_aligned(const MPSBufferView& dst_view, const MPSBufferView& s
     return is_vector_aligned(dst_view, dtype) && is_vector_aligned(src_view, dtype);
 }
 
-bool should_use_small_cpu_path(const at::Tensor& tensor) {
-    auto dtype = tensor.scalar_type();
-    return (dtype == at::kHalf || dtype == at::kBFloat16) &&
-           tensor.numel() <= small_gpu_threshold() &&
-           tensor_cpu_accessible(tensor);
-}
-
-bool should_use_small_cpu_binary_path(const at::Tensor& dst, const at::Tensor& src) {
-    return should_use_small_cpu_path(dst) && tensor_cpu_accessible(src);
-}
-
 id<MTLCommandBuffer> acquire_command_buffer(KernelCache& c, const char* label) {
     if (c.batch_cmd != nil) return c.batch_cmd;
     id<MTLCommandBuffer> cmd = [c.queue commandBuffer];
@@ -174,59 +152,9 @@ void finish_command_buffer(KernelCache& c, id<MTLCommandBuffer> cmd) {
     }
 }
 
-void cpu_small_reduce(const at::Tensor& dst, const at::Tensor& src,
-                      c10d::ReduceOp::RedOpType op) {
-    MPSBufferView dst_view = extract_mps_buffer(dst);
-    MPSBufferView src_view = extract_mps_buffer(src);
-    MCCL_CHECK(dst_view.cpu_accessible && src_view.cpu_accessible,
-               "Small CPU reduce path requires shared MPS storage");
-
-    int64_t count = dst.numel();
-    if (dst.scalar_type() == at::kHalf) {
-        cpu_reduce_op_half(static_cast<c10::Half*>(dst_view.cpu_ptr),
-                           static_cast<const c10::Half*>(src_view.cpu_ptr),
-                           count, op);
-    } else {
-        cpu_reduce_op_bf16(static_cast<c10::BFloat16*>(dst_view.cpu_ptr),
-                           static_cast<const c10::BFloat16*>(src_view.cpu_ptr),
-                           count, op);
-    }
-}
-
-void cpu_small_scale_inplace(const at::Tensor& buf, float scale) {
-    MPSBufferView view = extract_mps_buffer(buf);
-    MCCL_CHECK(view.cpu_accessible, "Small CPU scale path requires shared MPS storage");
-
-    int64_t count = buf.numel();
-    if (buf.scalar_type() == at::kHalf) {
-        cpu_scale_inplace_half(static_cast<c10::Half*>(view.cpu_ptr), count, scale);
-    } else {
-        cpu_scale_inplace_bf16(static_cast<c10::BFloat16*>(view.cpu_ptr), count, scale);
-    }
-}
-
-void cpu_small_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
-                                    float scale) {
-    MPSBufferView dst_view = extract_mps_buffer(dst);
-    MPSBufferView src_view = extract_mps_buffer(src);
-    MCCL_CHECK(dst_view.cpu_accessible && src_view.cpu_accessible,
-               "Small CPU fused path requires shared MPS storage");
-
-    int64_t count = dst.numel();
-    if (dst.scalar_type() == at::kHalf) {
-        cpu_accumulate_and_scale_half(static_cast<c10::Half*>(dst_view.cpu_ptr),
-                                      static_cast<const c10::Half*>(src_view.cpu_ptr),
-                                      count, scale);
-    } else {
-        cpu_accumulate_and_scale_bf16(static_cast<c10::BFloat16*>(dst_view.cpu_ptr),
-                                      static_cast<const c10::BFloat16*>(src_view.cpu_ptr),
-                                      count, scale);
-    }
-}
-
 uint32_t safe_numel(const at::Tensor& t) {
     int64_t n = t.numel();
-    MCCL_CHECK(n <= static_cast<int64_t>(UINT32_MAX),
+    DISTRO_CHECK(n <= static_cast<int64_t>(UINT32_MAX),
                "Tensor too large for Metal kernels (" + std::to_string(n) +
                " elements, max " + std::to_string(UINT32_MAX) +
                "). Use CPU reduction path for this tensor.");
@@ -263,20 +191,20 @@ void metal_kernels_init() {
 
     @autoreleasepool {
         c.device = (__bridge id<MTLDevice>)get_mtl_device();
-        c.queue  = (__bridge id<MTLCommandQueue>)get_mccl_command_queue();
+        c.queue  = (__bridge id<MTLCommandQueue>)get_distro_command_queue();
 
         NSError* err = nil;
         NSFileManager* fm = [NSFileManager defaultManager];
 
         // Search for precompiled metallib in priority order:
-        // 1. MCCL_SHADER_PATH env var (if it points to a .metallib)
+        // 1. DISTRO_SHADER_PATH env var (if it points to a .metallib)
         // 2. Next to this shared library (where setup.py installs it)
         // 3. Main bundle (for app embedding)
         // 4. Fall back to runtime compilation from .metal source
 
         NSMutableArray* metallib_search = [NSMutableArray array];
 
-        const char* env_path = std::getenv("MCCL_SHADER_PATH");
+        const char* env_path = std::getenv("DISTRO_SHADER_PATH");
         if (env_path) {
             NSString* envStr = @(env_path);
             if ([envStr hasSuffix:@".metallib"]) {
@@ -290,10 +218,10 @@ void metal_kernels_init() {
         if (dladdr((void*)metal_kernels_init, &dl_info) && dl_info.dli_fname) {
             NSString* soPath = @(dl_info.dli_fname);
             soDir = [soPath stringByDeletingLastPathComponent];
-            [metallib_search addObject:[soDir stringByAppendingPathComponent:@"mccl_shaders.metallib"]];
+            [metallib_search addObject:[soDir stringByAppendingPathComponent:@"distro_shaders.metallib"]];
         }
 
-        NSString* bundlePath = [[NSBundle mainBundle] pathForResource:@"mccl_shaders"
+        NSString* bundlePath = [[NSBundle mainBundle] pathForResource:@"distro_shaders"
                                                                ofType:@"metallib"];
         if (bundlePath) [metallib_search addObject:bundlePath];
 
@@ -302,7 +230,7 @@ void metal_kernels_init() {
                 NSURL* url = [NSURL fileURLWithPath:libPath];
                 c.library = [c.device newLibraryWithURL:url error:&err];
                 if (c.library) {
-                    MCCL_INFO("Loaded precompiled metallib: %s",
+                    DISTRO_INFO("Loaded precompiled metallib: %s",
                               [libPath UTF8String]);
                     break;
                 }
@@ -310,7 +238,7 @@ void metal_kernels_init() {
         }
 
         if (!c.library) {
-            MCCL_INFO("Compiling Metal shaders at runtime (no precompiled metallib found)");
+            DISTRO_INFO("Compiling Metal shaders at runtime (no precompiled metallib found)");
 
             NSString* srcPath = nil;
 
@@ -343,14 +271,14 @@ void metal_kernels_init() {
                 }
             }
 
-            MCCL_CHECK(srcPath != nil,
-                "Cannot find shaders.metal or mccl_shaders.metallib. "
-                "Set MCCL_SHADER_PATH env var.");
+            DISTRO_CHECK(srcPath != nil,
+                "Cannot find shaders.metal or distro_shaders.metallib. "
+                "Set DISTRO_SHADER_PATH env var.");
 
             NSString* src = [NSString stringWithContentsOfFile:srcPath
                                                      encoding:NSUTF8StringEncoding
                                                         error:&err];
-            MCCL_CHECK(src != nil, "Failed to read shaders.metal: " +
+            DISTRO_CHECK(src != nil, "Failed to read shaders.metal: " +
                        std::string([[err localizedDescription] UTF8String]));
 
             MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
@@ -365,7 +293,7 @@ void metal_kernels_init() {
             }
 
             c.library = [c.device newLibraryWithSource:src options:opts error:&err];
-            MCCL_CHECK(c.library != nil,
+            DISTRO_CHECK(c.library != nil,
                 "Metal shader compilation failed: " +
                 std::string([[err localizedDescription] UTF8String]));
         }
@@ -390,7 +318,7 @@ void metal_kernels_init() {
         c.product_bf16    = make_pipeline_if_present(c.device, c.library, @"elementwise_product_bf16");
 
         c.initialized.store(true, std::memory_order_release);
-        MCCL_INFO("Metal kernel cache initialized (fastMath=%s)",
+        DISTRO_INFO("Metal kernel cache initialized (fastMath=%s)",
                   metal_fast_math_enabled() ? "on" : "off");
     }
 }
@@ -398,7 +326,7 @@ void metal_kernels_init() {
 
 void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
 
     MPSBufferView dst_view = extract_mps_buffer(dst);
@@ -409,18 +337,14 @@ void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
 
     uint32_t count = safe_numel(dst);
     auto pso = select_accumulate_pipeline(c, dst.scalar_type());
-    MCCL_CHECK(pso != nil || should_use_small_cpu_binary_path(dst, src),
+    DISTRO_CHECK(pso != nil,
                "No Metal accumulate pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    if (should_use_small_cpu_binary_path(dst, src)) {
-        cpu_small_reduce(dst, src, c10d::ReduceOp::SUM);
-        return;
-    }
     auto dp = compute_dispatch(pso, count);
     bool aligned = binary_vector_aligned(dst_view, src_view, dst.scalar_type());
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_accumulate");
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "distro_accumulate");
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -439,25 +363,21 @@ void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
 
 void metal_scale_inplace(const at::Tensor& buf, double scale) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
 
     MPSBufferView view = extract_mps_buffer(buf);
     id<MTLBuffer> mtl_buf = (__bridge id<MTLBuffer>)view.mtl_buffer;
 
     uint32_t count = safe_numel(buf);
     auto pso = select_scale_pipeline(c, buf.scalar_type());
-    if (should_use_small_cpu_path(buf)) {
-        cpu_small_scale_inplace(buf, static_cast<float>(scale));
-        return;
-    }
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "No Metal scale pipeline for dtype " +
                std::string(at::toString(buf.scalar_type())));
     auto dp = compute_dispatch(pso, count);
     bool aligned = is_vector_aligned(view, buf.scalar_type());
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_scale");
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "distro_scale");
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -487,7 +407,7 @@ void metal_scale_inplace(const at::Tensor& buf, double scale) {
 void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
                                 double scale) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
 
     MPSBufferView dst_view = extract_mps_buffer(dst);
@@ -497,19 +417,15 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
     id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_view.mtl_buffer;
 
     uint32_t count = safe_numel(dst);
-    if (should_use_small_cpu_binary_path(dst, src)) {
-        cpu_small_accumulate_and_scale(dst, src, static_cast<float>(scale));
-        return;
-    }
     auto pso = select_accum_scale_pipeline(c, dst.scalar_type());
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "No Metal fused pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
     auto dp = compute_dispatch(pso, count);
     bool aligned = binary_vector_aligned(dst_view, src_view, dst.scalar_type());
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_accumulate_scale");
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "distro_accumulate_scale");
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -573,53 +489,41 @@ void dispatch_binary_op(id<MTLComputePipelineState> pso,
 
 void metal_elementwise_min(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
-    if (should_use_small_cpu_binary_path(dst, src)) {
-        cpu_small_reduce(dst, src, c10d::ReduceOp::MIN);
-        return;
-    }
     id<MTLComputePipelineState> pso = dst.scalar_type() == at::kFloat ? c.min_f32 :
                                       dst.scalar_type() == at::kHalf ? c.min_f16 :
                                       c.min_bf16;
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "No Metal min pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    dispatch_binary_op(pso, dst, src, "mccl_min");
+    dispatch_binary_op(pso, dst, src, "distro_min");
 }
 
 void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
-    if (should_use_small_cpu_binary_path(dst, src)) {
-        cpu_small_reduce(dst, src, c10d::ReduceOp::MAX);
-        return;
-    }
     id<MTLComputePipelineState> pso = dst.scalar_type() == at::kFloat ? c.max_f32 :
                                       dst.scalar_type() == at::kHalf ? c.max_f16 :
                                       c.max_bf16;
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "No Metal max pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    dispatch_binary_op(pso, dst, src, "mccl_max");
+    dispatch_binary_op(pso, dst, src, "distro_max");
 }
 
 void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
     check_same_shape_dtype(dst, src);
-    if (should_use_small_cpu_binary_path(dst, src)) {
-        cpu_small_reduce(dst, src, c10d::ReduceOp::PRODUCT);
-        return;
-    }
     id<MTLComputePipelineState> pso = dst.scalar_type() == at::kFloat ? c.product_f32 :
                                       dst.scalar_type() == at::kHalf ? c.product_f16 :
                                       c.product_bf16;
-    MCCL_CHECK(pso != nil,
+    DISTRO_CHECK(pso != nil,
                "No Metal product pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    dispatch_binary_op(pso, dst, src, "mccl_product");
+    dispatch_binary_op(pso, dst, src, "distro_product");
 }
 
 void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
@@ -653,11 +557,11 @@ void metal_sync() {
 
 void metal_begin_batch(const char* label) {
     KernelCache& c = cache();
-    MCCL_CHECK(c.initialized, "metal_kernels_init() not called");
-    MCCL_CHECK(c.batch_cmd == nil, "Metal batch already active");
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
+    DISTRO_CHECK(c.batch_cmd == nil, "Metal batch already active");
     @autoreleasepool {
         c.batch_cmd = [c.queue commandBuffer];
-        c.batch_cmd.label = @(label ? label : "mccl_batch");
+        c.batch_cmd.label = @(label ? label : "distro_batch");
     }
 }
 
@@ -671,4 +575,4 @@ void metal_end_batch() {
     }
 }
 
-} // namespace mccl
+} // namespace distro

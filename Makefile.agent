@@ -1,0 +1,54 @@
+# Build the distro agent — a lightweight daemon that runs on each Mac mini.
+#
+# The agent exposes Metal GPU buffers via RDMA and executes shaders on command
+# from the head node. It links against the same RDMA transport and Metal
+# interop layers as the full distro library, but excludes the coherence
+# protocol, scheduler, and Python bindings.
+#
+# Usage:
+#   make -f Makefile.agent
+#   ./distro-agent <port> <num_peers>
+
+CXX      := clang++
+SDK_PATH := $(shell xcrun --show-sdk-path)
+
+CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
+            -march=armv8.5-a+crc -isysroot $(SDK_PATH) \
+            -DDISTRO_BUILD -DDISTRO_AGENT_BUILD \
+            -I csrc
+
+LDFLAGS  := -framework Metal -framework Foundation -framework Accelerate \
+            -isysroot $(SDK_PATH)
+
+AGENT_SOURCES := \
+    csrc/agent/Agent.cpp \
+    csrc/transport/rdma/IbvWrapper.cpp \
+    csrc/transport/rdma/RdmaConnection.cpp \
+    csrc/transport/rdma/SharedBuffer.cpp \
+    csrc/metal/MPSInterop.mm \
+    csrc/metal/MetalKernels.mm \
+    csrc/metal/EventSync.mm \
+    csrc/runtime/MemoryPool.cpp \
+
+AGENT_OBJECTS := $(AGENT_SOURCES:%.cpp=build/%.o)
+AGENT_OBJECTS := $(AGENT_OBJECTS:%.mm=build/%.o)
+
+.PHONY: all clean
+
+all: distro-agent
+
+distro-agent: $(AGENT_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(CXX) -o $@ $^ $(LDFLAGS)
+	@echo "  → distro-agent built ($(shell ls -lh distro-agent | awk '{print $$5}'))"
+
+build/%.cpp.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+build/%.mm.o: %.mm
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fobjc-arc -c $< -o $@
+
+clean:
+	rm -rf build distro-agent

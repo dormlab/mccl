@@ -5,7 +5,7 @@
 #include <numeric>
 #include <cmath>
 
-namespace mccl {
+namespace distro {
 
 Metrics::Metrics() = default;
 
@@ -31,7 +31,7 @@ void Metrics::op_end(uint32_t seq) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = inflight_.find(seq);
     if (it == inflight_.end()) {
-        MCCL_WARN("Metrics::op_end: seq=%u not found in inflight table (double-complete or ordering bug)", seq);
+        DISTRO_WARN("Metrics::op_end: seq=%u not found in inflight table (double-complete or ordering bug)", seq);
         return;
     }
 
@@ -117,23 +117,23 @@ Metrics::Summary Metrics::summarize() const {
 
 void Metrics::log_summary() const {
     auto s = summarize();
-    MCCL_INFO("=== MCCL Metrics Summary ===");
-    MCCL_INFO("  Total ops:        %llu", (unsigned long long)s.total_ops);
-    MCCL_INFO("  Total sent:       %.2f MB",
+    DISTRO_INFO("=== MCCL Metrics Summary ===");
+    DISTRO_INFO("  Total ops:        %llu", (unsigned long long)s.total_ops);
+    DISTRO_INFO("  Total sent:       %.2f MB",
               s.total_bytes_sent / (1024.0 * 1024.0));
-    MCCL_INFO("  Total recv:       %.2f MB",
+    DISTRO_INFO("  Total recv:       %.2f MB",
               s.total_bytes_recv / (1024.0 * 1024.0));
-    MCCL_INFO("  Errors:           %llu", (unsigned long long)s.total_errors);
-    MCCL_INFO("  Avg latency:      %.3f ms", s.avg_latency_ms);
-    MCCL_INFO("  P50 latency:      %.3f ms", s.p50_latency_ms);
-    MCCL_INFO("  P99 latency:      %.3f ms", s.p99_latency_ms);
-    MCCL_INFO("  Peak throughput:  %.2f Gbps", s.peak_throughput_gbps);
-    MCCL_INFO("  Avg queue wait:   %.3f ms", s.avg_queue_wait_ms);
-    MCCL_INFO("  Avg execution:    %.3f ms", s.avg_execution_ms);
-    MCCL_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
-    MCCL_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
-    MCCL_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
-    MCCL_INFO("============================");
+    DISTRO_INFO("  Errors:           %llu", (unsigned long long)s.total_errors);
+    DISTRO_INFO("  Avg latency:      %.3f ms", s.avg_latency_ms);
+    DISTRO_INFO("  P50 latency:      %.3f ms", s.p50_latency_ms);
+    DISTRO_INFO("  P99 latency:      %.3f ms", s.p99_latency_ms);
+    DISTRO_INFO("  Peak throughput:  %.2f Gbps", s.peak_throughput_gbps);
+    DISTRO_INFO("  Avg queue wait:   %.3f ms", s.avg_queue_wait_ms);
+    DISTRO_INFO("  Avg execution:    %.3f ms", s.avg_execution_ms);
+    DISTRO_INFO("  Avg sync:         %.3f ms", s.avg_sync_ms);
+    DISTRO_INFO("  Avg network:      %.3f ms", s.avg_network_ms);
+    DISTRO_INFO("  Avg reduce:       %.3f ms", s.avg_reduce_ms);
+    DISTRO_INFO("============================");
 }
 
 void Metrics::reset() {
@@ -151,4 +151,4 @@ std::vector<OpMetric> Metrics::recent_ops(size_t n) const {
     return std::vector<OpMetric>(completed_.end() - n, completed_.end());
 }
 
-} // namespace mccl
+} // namespace distro

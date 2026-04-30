@@ -1,20 +1,20 @@
 #pragma once
 
-#define MCCL_VERSION_MAJOR 0
-#define MCCL_VERSION_MINOR 3
-#define MCCL_VERSION_PATCH 3
+#define DISTRO_VERSION_MAJOR 0
+#define DISTRO_VERSION_MINOR 4
+#define DISTRO_VERSION_PATCH 0
 
-#define MCCL_PROTOCOL_VERSION 3
+#define DISTRO_PROTOCOL_VERSION 1
 
-#define MCCL_VERSION_STRING "0.3.4"
+#define DISTRO_VERSION_STRING "0.4.0"
 
-namespace mccl {
+namespace distro {
 
 struct Version {
-    static constexpr int major = MCCL_VERSION_MAJOR;
-    static constexpr int minor = MCCL_VERSION_MINOR;
-    static constexpr int patch = MCCL_VERSION_PATCH;
-    static constexpr int protocol = MCCL_PROTOCOL_VERSION;
+    static constexpr int major   = DISTRO_VERSION_MAJOR;
+    static constexpr int minor   = DISTRO_VERSION_MINOR;
+    static constexpr int patch   = DISTRO_VERSION_PATCH;
+    static constexpr int protocol = DISTRO_PROTOCOL_VERSION;
 };
 
-} // namespace mccl
+} // namespace distro

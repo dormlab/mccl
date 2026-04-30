@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <atomic>
 
-namespace mccl {
+namespace distro {
 
 /// MPS / MCCL coordination helpers (MTLSharedEvent counters + bookkeeping).
 ///
@@ -13,7 +13,7 @@ namespace mccl {
 /// GPU reaches that signal. This replaces a full ``torch::mps::synchronize()``
 /// drain while still ordering MCCL reads after GPU-produced tensor data.
 ///
-/// ``signal_mccl_done`` / ``wait_for_mccl`` exist for future shader paths;
+/// ``signal_distro_done`` / ``wait_for_mccl`` exist for future shader paths;
 /// collectives today still rely on op completion before returning.
 
 /// Initialize the shared event infrastructure. Called once from
@@ -35,10 +35,10 @@ void wait_for_mps(uint64_t value);
 /// Signal from MCCL's side that the reduced gradients have been written.
 /// For the f32 CPU path this is a simple atomic store (unified memory is
 /// coherent).
-void signal_mccl_done(uint64_t value);
+void signal_distro_done(uint64_t value);
 
 /// GPU-side signal on MCCL's queue (reserved for shader-heavy paths; unused today).
-void signal_mccl_done_gpu(uint64_t value);
+void signal_distro_done_gpu(uint64_t value);
 
 /// Block until MCCL's signal reaches >= value.  Used by the non-f32 path
 /// where Metal shaders wrote the reduction result and the next MPS command
@@ -49,4 +49,4 @@ void wait_for_mccl(uint64_t value);
 /// generate unique signal values.
 uint64_t next_event_value();
 
-} // namespace mccl
+} // namespace distro

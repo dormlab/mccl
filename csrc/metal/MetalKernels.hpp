@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace mccl {
+namespace distro {
 
 void metal_kernels_init();
 
@@ -27,7 +27,7 @@ void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
 
 /// Reuse a single command buffer across multiple GPU kernel launches.
 /// Callers must end the batch before staging tensor data back to CPU/network.
-void metal_begin_batch(const char* label = "mccl_batch");
+void metal_begin_batch(const char* label = "distro_batch");
 void metal_end_batch();
 
 /// buf *= scale element-wise on GPU via Metal compute.
@@ -40,4 +40,4 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
 /// Block until all MCCL Metal commands have completed.
 void metal_sync();
 
-} // namespace mccl
+} // namespace distro

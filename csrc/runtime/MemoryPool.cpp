@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <algorithm>
 
-namespace mccl {
+namespace distro {
 
 MemoryPool::MemoryPool(size_t alignment) : alignment_(alignment) {}
 
@@ -36,7 +36,7 @@ MemoryPool::Buffer MemoryPool::acquire(size_t nbytes) {
         Buffer buf = pool_[best];
         pool_.erase(pool_.begin() + best);
         buf.used = nbytes;
-        MCCL_TRACE("MemoryPool: reused %zu-byte buffer for %zu request",
+        DISTRO_TRACE("MemoryPool: reused %zu-byte buffer for %zu request",
                    buf.capacity, nbytes);
         return buf;
     }
@@ -51,14 +51,14 @@ MemoryPool::Buffer MemoryPool::acquire(size_t nbytes) {
     void* ptr = nullptr;
     int rc = posix_memalign(&ptr, alignment_, alloc_size);
     if (rc != 0 || !ptr) {
-        MCCL_ERROR("MemoryPool: posix_memalign failed: rc=%d alloc_size=%zu errno=%d (%s)",
+        DISTRO_ERROR("MemoryPool: posix_memalign failed: rc=%d alloc_size=%zu errno=%d (%s)",
                    rc, alloc_size, errno, strerror(errno));
         throw MCCLError("MemoryPool: allocation failed for " +
                         std::to_string(alloc_size) + " bytes");
     }
 
     total_allocated_ += alloc_size;
-    MCCL_INFO("MemoryPool: allocated %zu bytes (requested %zu, total=%zu)",
+    DISTRO_INFO("MemoryPool: allocated %zu bytes (requested %zu, total=%zu)",
               alloc_size, nbytes, total_allocated_);
 
     return Buffer{ptr, alloc_size, nbytes};
@@ -89,7 +89,7 @@ void MemoryPool::trim() {
         total_allocated_ -= buf.capacity;
     }
     pool_.clear();
-    MCCL_DEBUG("MemoryPool: trimmed, total_allocated=%zu", total_allocated_);
+    DISTRO_DEBUG("MemoryPool: trimmed, total_allocated=%zu", total_allocated_);
 }
 
 // ── PooledBuffer ────────────────────────────────────────────────────
@@ -125,4 +125,4 @@ MemoryPool& staging_memory_pool() {
     return pool;
 }
 
-} // namespace mccl
+} // namespace distro

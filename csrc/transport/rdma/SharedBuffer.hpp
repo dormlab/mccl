@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace mccl {
+namespace distro {
 
 /// Page-aligned buffer registered with one or more RDMA protection domains.
 ///
@@ -24,6 +24,10 @@ public:
     SharedBuffer(SharedBuffer&& other) noexcept;
     SharedBuffer& operator=(SharedBuffer&& other) noexcept;
 
+    /// Allocate or re-allocate the backing buffer to nbytes.
+    /// Cleans up any previous allocation and registrations.
+    void allocate(size_t nbytes);
+
     /// Register this buffer with a protection domain.
     /// Returns the ibv_mr* on success, nullptr on failure.
     /// Access flags: LOCAL_WRITE | REMOTE_READ | REMOTE_WRITE.
@@ -39,12 +43,8 @@ public:
     void*  data()  const { return buf_; }
     size_t size()  const { return nbytes_; }
 
-private:
+    /// Free all registrations and the backing buffer.
     void cleanup();
-
-    void*  buf_    = nullptr;
-    size_t nbytes_ = 0;
-    std::vector<ibv_mr*> registrations_;
 };
 
-} // namespace mccl
+} // namespace distro

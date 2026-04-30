@@ -1,15 +1,8 @@
 """
-MCCL build script.
+MCCL build script — Distributed Metal GPU Runtime.
 
-Builds the C++/Obj-C++ extension that provides the ProcessGroupMCCL backend on
-macOS Apple Silicon.
-
-If ``xcrun metal`` is available, ``mccl_shaders.metallib`` is built next to ``_C``.
-If not (CLT-only machine), the build **warns and skips** metallib and still copies
-``shaders.metal`` beside the extension for **runtime JIT**.
-
-For **PyPI / release wheels**, set ``MCCL_REQUIRE_METALLIB=1`` so the build **fails**
-when the Metal CLI is missing (ensures every wheel ships a ``.metallib``).
+Builds the C++/Obj-C++ extension with the DMEM layer, coherence protocol,
+and Distributed Metal Runtime on macOS Apple Silicon.
 """
 import os
 import platform
@@ -19,12 +12,10 @@ import subprocess
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
-# Paths relative to this file — pip/build isolation cwd is not always the repo root.
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def _shaders_metal_path() -> str:
-    """Canonical shader source: ``csrc/metal/``; fallback ``mccl/shaders.metal`` (legacy copy)."""
     for parts in (
         ("csrc", "metal", "shaders.metal"),
         ("mccl", "shaders.metal"),
@@ -40,9 +31,8 @@ def _torch_include_dirs():
     import torch
     from torch.utils.cpp_extension import include_paths
     torch_root = os.path.join(os.path.dirname(torch.__file__), "include")
-    distributed_inc = os.path.join(torch_root, "torch", "csrc", "distributed")
     python_inc = sysconfig.get_path("include")
-    return include_paths() + [distributed_inc, python_inc]
+    return include_paths() + [python_inc]
 
 
 def _torch_library_dirs():
@@ -81,7 +71,7 @@ class MCCLBuildExt(build_ext):
                 "-Wextra",
                 "-Wno-unused-parameter",
                 "-fvisibility=hidden",
-                "-DMCCL_BUILD",
+                "-DDISTRO_BUILD",
                 "-march=armv8.5-a+crc",
                 "-isysroot", sdk_path,
             ]
@@ -111,7 +101,7 @@ class MCCLBuildExt(build_ext):
 
         for src in sources_cpp:
             flags = ext._cpp_flags
-            if src.endswith("Registration.cpp"):
+            if src.endswith("bindings.cpp"):
                 flags = [f for f in flags if f != "-fvisibility=hidden"]
             obj = self._compile_single(src, flags, ext)
             objects.append(obj)
@@ -133,8 +123,6 @@ class MCCLBuildExt(build_ext):
         self._link_shared_object(objects, ext)
 
     def _compile_single(self, src, flags, ext):
-        import torch
-
         obj = src + ".o"
         obj_path = os.path.join(self.build_temp, obj)
         os.makedirs(os.path.dirname(obj_path), exist_ok=True)
@@ -164,15 +152,11 @@ class MCCLBuildExt(build_ext):
 
         self._fixup_rpath(ext_path)
         out_dir = os.path.dirname(ext_path)
-        # Install source shaders before metallib so this always runs even if REQUIRE+metal fails.
-        # Editable / mixed layouts may load _C from mccl/mccl/ while setuptools links under build/;
-        # deploy beside every such directory so dladdr finds shaders.metal next to the loaded .so.
         self._install_shaders_metal_for_ext(ext, out_dir)
         self._compile_metallib(ext, out_dir)
 
     @staticmethod
     def _fixup_rpath(ext_path):
-        """Replace the build-time torch rpath with a relative one that works at runtime."""
         import torch
         runtime_torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
         result = subprocess.run(
@@ -190,24 +174,22 @@ class MCCLBuildExt(build_ext):
 
     @staticmethod
     def _detect_metal_std():
-        """Pick the highest Metal language standard the host toolchain supports."""
-        mac_ver = platform.mac_ver()[0]  # e.g. "15.1.1" or "14.7.2"
+        mac_ver = platform.mac_ver()[0]
         if mac_ver:
             major = int(mac_ver.split(".")[0])
             if major >= 15:
                 return "metal3.1"
         return "metal3.0"
 
-    def _shader_bundle_dest_dirs(self, ext: Extension, primary_out_dir: str) -> list[str]:
-        """Dirs that should hold ``shaders.metal`` / ``mccl_shaders.metallib`` next to ``_C``."""
+    def _shader_bundle_dest_dirs(self, ext, primary_out_dir):
         dirs = [os.path.normpath(primary_out_dir)]
         parts = ext.name.split(".")
         if len(parts) >= 2:
             pkg_path = os.path.normpath(os.path.join(_REPO_ROOT, *parts[:-1]))
             if os.path.isdir(pkg_path):
                 dirs.append(pkg_path)
-        seen_real: set[str] = set()
-        unique: list[str] = []
+        seen_real = set()
+        unique = []
         for d in dirs:
             try:
                 key = os.path.realpath(d)
@@ -218,14 +200,12 @@ class MCCLBuildExt(build_ext):
                 unique.append(d)
         return unique
 
-    def _install_shaders_metal_for_ext(self, ext: Extension, primary_out_dir: str) -> None:
-        """Copy ``shaders.metal`` beside ``_C`` in every layout setuptools / editable may use."""
+    def _install_shaders_metal_for_ext(self, ext, primary_out_dir):
         shader_src = _shaders_metal_path()
         if not os.path.isfile(shader_src):
             raise RuntimeError(
                 "MCCL build requires shaders.metal at "
-                f"{os.path.join(_REPO_ROOT, 'csrc', 'metal', 'shaders.metal')} "
-                "(restore from upstream mccl repo if missing)."
+                f"{os.path.join(_REPO_ROOT, 'csrc', 'metal', 'shaders.metal')}"
             )
         for d in self._shader_bundle_dest_dirs(ext, primary_out_dir):
             os.makedirs(d, exist_ok=True)
@@ -233,17 +213,13 @@ class MCCLBuildExt(build_ext):
             shutil.copy2(shader_src, dst)
             self.announce(f"Installed shaders.metal next to extension: {dst}", level=2)
 
-    def _compile_metallib(self, ext: Extension, output_dir: str) -> None:
+    def _compile_metallib(self, ext, output_dir):
         shader_src = _shaders_metal_path()
         if not os.path.isfile(shader_src):
-            raise RuntimeError(
-                f"MCCL build requires {shader_src} in the source tree."
-            )
+            raise RuntimeError(f"MCCL build requires {shader_src} in the source tree.")
 
         require_metallib = os.environ.get("MCCL_REQUIRE_METALLIB", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
+            "1", "true", "yes",
         )
 
         try:
@@ -252,21 +228,18 @@ class MCCLBuildExt(build_ext):
             )
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             msg = (
-                "Metal shader compiler not found (`xcrun metal`). Skipping precompiled "
-                "mccl_shaders.metallib; shaders.metal is still installed next to _C for runtime JIT. "
-                "For PyPI wheels, build on a Mac with full Xcode and set MCCL_REQUIRE_METALLIB=1 "
-                "so this step cannot be skipped silently."
+                "Metal shader compiler not found. Skipping precompiled "
+                "distro_shaders.metallib; shaders.metal installed for runtime JIT."
             )
             if require_metallib:
                 raise RuntimeError(
-                    "MCCL_REQUIRE_METALLIB=1 but `xcrun metal` is not available — "
-                    "install full Xcode (not Command Line Tools only)."
+                    "MCCL_REQUIRE_METALLIB=1 but `xcrun metal` is not available."
                 ) from e
             self.warn(msg)
             return
 
-        air_path = os.path.join(self.build_temp, "mccl_shaders.air")
-        lib_path = os.path.join(output_dir, "mccl_shaders.metallib")
+        air_path = os.path.join(self.build_temp, "distro_shaders.air")
+        lib_path = os.path.join(output_dir, "distro_shaders.metallib")
         os.makedirs(os.path.dirname(air_path), exist_ok=True)
 
         sdk_path = subprocess.check_output(
@@ -274,9 +247,7 @@ class MCCLBuildExt(build_ext):
         ).strip()
 
         metal_std = self._detect_metal_std()
-        self.announce(
-            f"Compiling {shader_src} -> .air (std={metal_std})", level=2
-        )
+        self.announce(f"Compiling {shader_src} -> .air (std={metal_std})", level=2)
         subprocess.check_call([
             "xcrun", "metal",
             "-c", shader_src,
@@ -300,53 +271,59 @@ class MCCLBuildExt(build_ext):
         for d in self._shader_bundle_dest_dirs(ext, output_dir):
             if os.path.normpath(d) == os.path.normpath(output_dir):
                 continue
-            dup = os.path.join(d, "mccl_shaders.metallib")
+            dup = os.path.join(d, "distro_shaders.metallib")
             shutil.copy2(lib_path, dup)
             self.announce(f"Synced metallib to {dup}", level=2)
 
 
 CPP_SOURCES = [
-    "csrc/backend/ProcessGroupMCCL.cpp",
-    "csrc/backend/WorkMCCL.cpp",
-    "csrc/backend/Registration.cpp",
-    "csrc/backend/MPSDispatch.cpp",
-    "csrc/transport/TcpTransport.cpp",
-    "csrc/transport/Connection.cpp",
+    # DMEM
+    "csrc/dmem/DistributedMemoryManager.cpp",
+    "csrc/dmem/MemoryCatalog.cpp",
+    # Coherence
+    "csrc/coherence/CoherenceProtocol.cpp",
+    "csrc/coherence/CoherenceDirectory.cpp",
+    # Runtime
+    "csrc/runtime/ClusterManager.cpp",
+    "csrc/runtime/Scheduler.cpp",
+    "csrc/runtime/DistributedMetalRuntime.cpp",
     "csrc/runtime/ProgressEngine.cpp",
     "csrc/runtime/Rendezvous.cpp",
-    "csrc/runtime/Watchdog.cpp",
-    "csrc/runtime/HealthMonitor.cpp",
     "csrc/runtime/Metrics.cpp",
     "csrc/runtime/MemoryPool.cpp",
-    "csrc/compression/Compression.cpp",
-    "csrc/compression/FP16Compression.cpp",
-    "csrc/compression/TopKCompression.cpp",
-    "csrc/transport/rdma/RdmaTransport.cpp",
+    "csrc/runtime/MCCLDeviceMutex.cpp",
+    # RDMA transport
     "csrc/transport/rdma/IbvWrapper.cpp",
     "csrc/transport/rdma/RdmaConnection.cpp",
     "csrc/transport/rdma/SharedBuffer.cpp",
+    # Python bindings
+    "csrc/python/bindings.cpp",
 ]
 
 MM_SOURCES = [
     "csrc/metal/MPSInterop.mm",
     "csrc/metal/MetalKernels.mm",
-    "csrc/metal/AccelerateOps.mm",
     "csrc/metal/EventSync.mm",
 ]
 
 ext = Extension(
-    name="mccl._C",
+    name="distro._C",
     sources=CPP_SOURCES + MM_SOURCES,
     include_dirs=["csrc"],
     language="c++",
 )
 
 setup(
-    name="mccl",
-    version="0.3.4",
-    description="MPS-native ProcessGroup backend for PyTorch Distributed on Apple Silicon",
-    packages=["mccl"],
+    name="distro",
+    version="0.4.0",
+    description="Distributed Metal GPU Runtime for Apple Silicon clusters",
+    packages=["distro", "distro.distributed"],
     ext_modules=[ext],
     cmdclass={"build_ext": MCCLBuildExt},
     python_requires=">=3.11",
+    entry_points={
+        "console_scripts": [
+            "distro=distro.cli:main",
+        ],
+    },
 )

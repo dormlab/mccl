@@ -11,15 +11,15 @@
 #include <atomic>
 #include <thread>
 
-namespace mccl {
+namespace distro {
 
 namespace {
 
 struct EventState {
     id<MTLSharedEvent> mps_event   = nil;
-    id<MTLSharedEvent> mccl_event  = nil;
+    id<MTLSharedEvent> distro_event  = nil;
     id<MTLDevice>      device      = nil;
-    id<MTLCommandQueue> mccl_queue = nil;
+    id<MTLCommandQueue> distro_queue = nil;
     std::atomic<uint64_t> counter{0};
     std::atomic<bool> initialized{false};
 };
@@ -51,7 +51,7 @@ void spin_wait_event(id<MTLSharedEvent> event, uint64_t target) {
         if (delay < max_delay) {
             delay *= 2;
         }
-        MCCL_CHECK(std::chrono::steady_clock::now() < deadline,
+        DISTRO_CHECK(std::chrono::steady_clock::now() < deadline,
                    "spin_wait_event timed out after 30s waiting for event value " +
                    std::to_string(target) + " (current=" +
                    std::to_string(event.signaledValue) + ")");
@@ -68,28 +68,28 @@ void event_sync_init() {
     @autoreleasepool {
         s.device = (__bridge id<MTLDevice>)get_mtl_device();
         if (!s.device) {
-            MCCL_WARN("EventSync: no Metal device, event sync disabled");
+            DISTRO_WARN("EventSync: no Metal device, event sync disabled");
             return;
         }
 
-        s.mccl_queue = (__bridge id<MTLCommandQueue>)get_mccl_command_queue();
+        s.distro_queue = (__bridge id<MTLCommandQueue>)get_distro_command_queue();
 
         s.mps_event = [s.device newSharedEvent];
         if (!s.mps_event) {
-            MCCL_WARN("EventSync: MTLSharedEvent creation failed (mps_event)");
+            DISTRO_WARN("EventSync: MTLSharedEvent creation failed (mps_event)");
             return;
         }
 
-        s.mccl_event = [s.device newSharedEvent];
-        if (!s.mccl_event) {
-            MCCL_WARN("EventSync: MTLSharedEvent creation failed (mccl_event)");
+        s.distro_event = [s.device newSharedEvent];
+        if (!s.distro_event) {
+            DISTRO_WARN("EventSync: MTLSharedEvent creation failed (distro_event)");
             s.mps_event = nil;
             return;
         }
 
         s.counter.store(0);
         s.initialized.store(true, std::memory_order_release);
-        MCCL_INFO("EventSync initialized (MTLSharedEvent-based sync)");
+        DISTRO_INFO("EventSync initialized (MTLSharedEvent-based sync)");
     }
 }
 
@@ -99,7 +99,7 @@ bool event_sync_available() {
 
 void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
-    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
     // Encode a signal on PyTorch's active MPS command buffer then commit it.
     // dispatch_sync on PyTorch's serial queue guarantees our encoding happens
@@ -122,41 +122,41 @@ void commit_mps_and_signal(uint64_t value) {
 
 void wait_for_mps(uint64_t value) {
     EventState& s = state();
-    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    DISTRO_CHECK(s.initialized, "EventSync not initialized");
     spin_wait_event(s.mps_event, value);
 }
 
-void signal_mccl_done(uint64_t value) {
+void signal_distro_done(uint64_t value) {
     EventState& s = state();
-    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
     // For the CPU reduction path (f32 vDSP), results are written directly
     // to unified memory -- just update the event counter so anyone polling
     // knows we're done.  For the Metal shader path we encode the signal on
     // MCCL's command queue and commit.
-    s.mccl_event.signaledValue = value;
+    s.distro_event.signaledValue = value;
 }
 
-void signal_mccl_done_gpu(uint64_t value) {
+void signal_distro_done_gpu(uint64_t value) {
     EventState& s = state();
-    MCCL_CHECK(s.initialized, "EventSync not initialized");
+    DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [s.mccl_queue commandBuffer];
-        cmd.label = @"mccl_signal_done";
-        [cmd encodeSignalEvent:s.mccl_event value:value];
+        id<MTLCommandBuffer> cmd = [s.distro_queue commandBuffer];
+        cmd.label = @"distro_signal_done";
+        [cmd encodeSignalEvent:s.distro_event value:value];
         [cmd commit];
     }
 }
 
 void wait_for_mccl(uint64_t value) {
     EventState& s = state();
-    MCCL_CHECK(s.initialized, "EventSync not initialized");
-    spin_wait_event(s.mccl_event, value);
+    DISTRO_CHECK(s.initialized, "EventSync not initialized");
+    spin_wait_event(s.distro_event, value);
 }
 
 uint64_t next_event_value() {
     return state().counter.fetch_add(1) + 1;
 }
 
-} // namespace mccl
+} // namespace distro

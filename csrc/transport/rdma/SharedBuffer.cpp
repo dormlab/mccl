@@ -7,18 +7,24 @@
 #include <unistd.h>
 #include <utility>
 
-namespace mccl {
+namespace distro {
 
 static size_t page_size() {
     static const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     return ps;
 }
 
-SharedBuffer::SharedBuffer(size_t nbytes)
-    : nbytes_(nbytes) {
+SharedBuffer::SharedBuffer(size_t nbytes) {
+    allocate(nbytes);
+}
+
+void SharedBuffer::allocate(size_t nbytes) {
+    cleanup();
+    nbytes_ = nbytes;
+    if (nbytes_ == 0) return;
     int rc = posix_memalign(&buf_, page_size(), nbytes_);
     if (rc != 0 || !buf_) {
-        MCCL_ERROR("SharedBuffer: posix_memalign(%zu) failed: %d", nbytes_, rc);
+        DISTRO_ERROR("SharedBuffer: posix_memalign(%zu) failed: %d", nbytes_, rc);
         buf_ = nullptr;
         nbytes_ = 0;
         return;
@@ -72,7 +78,7 @@ ibv_mr* SharedBuffer::register_with(ibv_pd* pd) {
     int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
     ibv_mr* mr = fns->reg_mr(pd, buf_, nbytes_, access);
     if (!mr) {
-        MCCL_ERROR("SharedBuffer: ibv_reg_mr failed for %zu bytes", nbytes_);
+        DISTRO_ERROR("SharedBuffer: ibv_reg_mr failed for %zu bytes", nbytes_);
         return nullptr;
     }
     registrations_.push_back(mr);
@@ -91,4 +97,4 @@ ibv_sge SharedBuffer::to_sge(ibv_mr* mr) const {
     return to_sge(mr, 0, static_cast<uint32_t>(nbytes_));
 }
 
-} // namespace mccl
+} // namespace distro

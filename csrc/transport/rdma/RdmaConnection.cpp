@@ -5,7 +5,7 @@
 #include <cstring>
 #include <utility>
 
-namespace mccl {
+namespace distro {
 
 RdmaConnection::RdmaConnection() = default;
 
@@ -51,13 +51,13 @@ bool RdmaConnection::open(ibv_device* device, int cq_depth) {
 
     ctx_ = fns_->open_device(device);
     if (!ctx_) {
-        MCCL_ERROR("RdmaConnection: ibv_open_device failed");
+        DISTRO_ERROR("RdmaConnection: ibv_open_device failed");
         return false;
     }
 
     pd_ = fns_->alloc_pd(ctx_);
     if (!pd_) {
-        MCCL_ERROR("RdmaConnection: ibv_alloc_pd failed");
+        DISTRO_ERROR("RdmaConnection: ibv_alloc_pd failed");
         destroy();
         return false;
     }
@@ -65,7 +65,7 @@ bool RdmaConnection::open(ibv_device* device, int cq_depth) {
     int actual_cq_depth = cq_depth * 2;
     cq_ = fns_->create_cq(ctx_, actual_cq_depth, nullptr, nullptr, 0);
     if (!cq_) {
-        MCCL_ERROR("RdmaConnection: ibv_create_cq(%d) failed", actual_cq_depth);
+        DISTRO_ERROR("RdmaConnection: ibv_create_cq(%d) failed", actual_cq_depth);
         destroy();
         return false;
     }
@@ -83,12 +83,12 @@ bool RdmaConnection::open(ibv_device* device, int cq_depth) {
 
     qp_ = fns_->create_qp(pd_, &init_attr);
     if (!qp_) {
-        MCCL_ERROR("RdmaConnection: ibv_create_qp (RC) failed");
+        DISTRO_ERROR("RdmaConnection: ibv_create_qp (RC) failed");
         destroy();
         return false;
     }
 
-    MCCL_DEBUG("RdmaConnection: QP %u created (RC, CQ depth %d)", qp_->qp_num, cq_depth);
+    DISTRO_DEBUG("RdmaConnection: QP %u created (RC, CQ depth %d)", qp_->qp_num, cq_depth);
     return true;
 }
 
@@ -105,7 +105,7 @@ bool RdmaConnection::init(uint8_t port) {
 
     int mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
     if (fns_->modify_qp(qp_, &attr, mask) != 0) {
-        MCCL_ERROR("RdmaConnection: QP → INIT failed");
+        DISTRO_ERROR("RdmaConnection: QP → INIT failed");
         return false;
     }
     return true;
@@ -139,7 +139,7 @@ bool RdmaConnection::activate(const RdmaDestination& remote, uint8_t port) {
                    IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                    IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
         if (fns_->modify_qp(qp_, &attr, mask) != 0) {
-            MCCL_ERROR("RdmaConnection: QP → RTR failed");
+            DISTRO_ERROR("RdmaConnection: QP → RTR failed");
             return false;
         }
     }
@@ -160,12 +160,12 @@ bool RdmaConnection::activate(const RdmaDestination& remote, uint8_t port) {
         int mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
                    IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
         if (fns_->modify_qp(qp_, &attr, mask) != 0) {
-            MCCL_ERROR("RdmaConnection: QP → RTS failed");
+            DISTRO_ERROR("RdmaConnection: QP → RTS failed");
             return false;
         }
     }
 
-    MCCL_DEBUG("RdmaConnection: QP %u activated (remote QP %u, LID %u)",
+    DISTRO_DEBUG("RdmaConnection: QP %u activated (remote QP %u, LID %u)",
                qp_->qp_num, remote.qp_number, remote.local_id);
     return true;
 }
@@ -198,7 +198,7 @@ bool RdmaConnection::post_send(ibv_sge& sge, uint64_t wr_id) {
     ibv_send_wr* bad_wr = nullptr;
     int rc = fns_->post_send(qp_, &wr, &bad_wr);
     if (rc != 0) {
-        MCCL_ERROR("RdmaConnection: ibv_post_send failed: %d", rc);
+        DISTRO_ERROR("RdmaConnection: ibv_post_send failed: %d", rc);
         return false;
     }
     return true;
@@ -216,7 +216,103 @@ bool RdmaConnection::post_recv(ibv_sge& sge, uint64_t wr_id) {
     ibv_recv_wr* bad_wr = nullptr;
     int rc = fns_->post_recv(qp_, &wr, &bad_wr);
     if (rc != 0) {
-        MCCL_ERROR("RdmaConnection: ibv_post_recv failed: %d", rc);
+        DISTRO_ERROR("RdmaConnection: ibv_post_recv failed: %d", rc);
+        return false;
+    }
+    return true;
+}
+
+bool RdmaConnection::post_rdma_write(ibv_sge& sge, uint64_t remote_addr,
+                                     uint32_t rkey, uint64_t wr_id,
+                                     bool signaled) {
+    if (!fns_ || !qp_) return false;
+
+    ibv_send_wr wr{};
+    wr.wr_id      = wr_id;
+    wr.next       = nullptr;
+    wr.sg_list    = &sge;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_RDMA_WRITE;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey        = rkey;
+
+    ibv_send_wr* bad_wr = nullptr;
+    int rc = fns_->post_send(qp_, &wr, &bad_wr);
+    if (rc != 0) {
+        DISTRO_ERROR("RdmaConnection: ibv_post_send (RDMA_WRITE) failed: %d", rc);
+        return false;
+    }
+    return true;
+}
+
+bool RdmaConnection::post_rdma_read(ibv_sge& sge, uint64_t remote_addr,
+                                    uint32_t rkey, uint64_t wr_id,
+                                    bool signaled) {
+    if (!fns_ || !qp_) return false;
+
+    ibv_send_wr wr{};
+    wr.wr_id      = wr_id;
+    wr.next       = nullptr;
+    wr.sg_list    = &sge;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_RDMA_READ;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey        = rkey;
+
+    ibv_send_wr* bad_wr = nullptr;
+    int rc = fns_->post_send(qp_, &wr, &bad_wr);
+    if (rc != 0) {
+        DISTRO_ERROR("RdmaConnection: ibv_post_send (RDMA_READ) failed: %d", rc);
+        return false;
+    }
+    return true;
+}
+
+bool RdmaConnection::post_rdma_write_with_imm(ibv_sge& sge, uint64_t remote_addr,
+                                              uint32_t rkey, uint32_t imm_data,
+                                              uint64_t wr_id) {
+    if (!fns_ || !qp_) return false;
+
+    ibv_send_wr wr{};
+    wr.wr_id      = wr_id;
+    wr.next       = nullptr;
+    wr.sg_list    = &sge;
+    wr.num_sge    = 1;
+    wr.opcode     = IBV_WR_RDMA_WRITE_WITH_IMM;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.imm_data   = imm_data;
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey        = rkey;
+
+    ibv_send_wr* bad_wr = nullptr;
+    int rc = fns_->post_send(qp_, &wr, &bad_wr);
+    if (rc != 0) {
+        DISTRO_ERROR("RdmaConnection: ibv_post_send (RDMA_WRITE_WITH_IMM) failed: %d", rc);
+        return false;
+    }
+    return true;
+}
+
+bool RdmaConnection::post_fence(uint64_t wr_id) {
+    if (!fns_ || !qp_) return false;
+
+    ibv_send_wr wr{};
+    wr.wr_id      = wr_id;
+    wr.next       = nullptr;
+    wr.sg_list    = nullptr;
+    wr.num_sge    = 0;
+    wr.opcode     = IBV_WR_RDMA_WRITE;  // NOP-like; only the fence flag matters
+    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_FENCE;
+    // When num_sge == 0, the RDMA write transfers zero bytes — effectively a
+    // fence-only operation with a completion. The fence flag ensures all prior
+    // WRs on this QP complete before this one executes.
+
+    ibv_send_wr* bad_wr = nullptr;
+    int rc = fns_->post_send(qp_, &wr, &bad_wr);
+    if (rc != 0) {
+        DISTRO_ERROR("RdmaConnection: ibv_post_send (FENCE) failed: %d", rc);
         return false;
     }
     return true;
@@ -227,4 +323,4 @@ int RdmaConnection::poll(int max_wc, ibv_wc* wc_out) {
     return fns_->poll_cq(cq_, max_wc, wc_out);
 }
 
-} // namespace mccl
+} // namespace distro

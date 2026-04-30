@@ -7,7 +7,7 @@
 #include <mutex>
 #include <string>
 
-namespace mccl {
+namespace distro {
 
 enum class LogLevel : int {
     TRACE = 0,
@@ -20,7 +20,7 @@ enum class LogLevel : int {
 };
 
 inline LogLevel log_level_from_env() {
-    const char* env = std::getenv("MCCL_LOG_LEVEL");
+    const char* env = std::getenv("DISTRO_LOG_LEVEL");
     if (!env) return LogLevel::WARN;
     std::string s(env);
     if (s == "TRACE" || s == "trace" || s == "0") return LogLevel::TRACE;
@@ -80,25 +80,25 @@ inline void log_impl(LogLevel level, const char* file, int line,
 #define MCCL_LOG(lvl, ...)                                             \
     ::mccl::log_impl(::mccl::LogLevel::lvl, __FILE__, __LINE__, __VA_ARGS__)
 
-#define MCCL_TRACE(...) MCCL_LOG(TRACE, __VA_ARGS__)
-#define MCCL_DEBUG(...) MCCL_LOG(DEBUG, __VA_ARGS__)
-#define MCCL_INFO(...)  MCCL_LOG(INFO,  __VA_ARGS__)
-#define MCCL_WARN(...)  MCCL_LOG(WARN,  __VA_ARGS__)
-#define MCCL_ERROR(...) MCCL_LOG(ERROR, __VA_ARGS__)
+#define DISTRO_TRACE(...) MCCL_LOG(TRACE, __VA_ARGS__)
+#define DISTRO_DEBUG(...) MCCL_LOG(DEBUG, __VA_ARGS__)
+#define DISTRO_INFO(...)  MCCL_LOG(INFO,  __VA_ARGS__)
+#define DISTRO_WARN(...)  MCCL_LOG(WARN,  __VA_ARGS__)
+#define DISTRO_ERROR(...) MCCL_LOG(ERROR, __VA_ARGS__)
 
-// MCCL_FATAL logs at the highest severity level but does NOT terminate the
+// DISTRO_FATAL logs at the highest severity level but does NOT terminate the
 // process.  Use it for serious errors that are being handled gracefully (e.g.
 // a collective that will surface as a Python exception via markError).
-#define MCCL_FATAL(...) MCCL_LOG(FATAL, __VA_ARGS__)
+#define DISTRO_FATAL(...) MCCL_LOG(FATAL, __VA_ARGS__)
 
-// MCCL_ABORT logs at FATAL level and then terminates the process immediately.
+// DISTRO_ABORT logs at FATAL level and then terminates the process immediately.
 // Reserve this for truly unrecoverable conditions where continuing would
 // corrupt state (e.g. an assertion failure inside a callback that has no
 // error-propagation path).
-#define MCCL_ABORT(...)                                                \
+#define DISTRO_ABORT(...)                                                \
     do {                                                               \
         MCCL_LOG(FATAL, __VA_ARGS__);                                  \
         std::terminate();                                              \
     } while (false)
 
-} // namespace mccl
+} // namespace distro
