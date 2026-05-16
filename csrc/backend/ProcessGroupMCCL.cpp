@@ -1,5 +1,6 @@
 #include "backend/ProcessGroupMCCL.hpp"
 #include "backend/WorkMCCL.hpp"
+#include "backend/PeerMesh.hpp"
 #include "runtime/Rendezvous.hpp"
 #include "common/Errors.hpp"
 
@@ -7,6 +8,7 @@
 
 #include <cstring>
 #include <string>
+#include <thread>
 
 namespace distro {
 
@@ -74,6 +76,8 @@ ProcessGroupMCCL::ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
     if (size > 1) {
         rendezvous_ = std::make_unique<Rendezvous>(
             store_, rank, size, opts_.timeout);
+        mesh_ = std::make_unique<PeerMesh>(
+            store_, rank, size, opts_.timeout);
     }
 }
 
@@ -87,14 +91,23 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     try {
         auto op = opts.reduceOp;
         for (auto& t : tensors) {
-            uint64_t s = next_seq_();
             auto acc = t.contiguous().cpu();
-            store_->set(key("ar", s, getRank()), tensor_to_bytes(acc));
+            size_t nbytes = acc.nbytes();
+            std::vector<std::vector<uint8_t>> recvbufs(getSize());
+            std::vector<std::thread> ts;
+            ts.reserve(getSize() - 1);
             for (int p = 0; p < getSize(); ++p) {
                 if (p == getRank()) continue;
-                auto k = key("ar", s, p);
-                store_->wait({k}, opts_.timeout);
-                auto peer = bytes_to_cpu_like(store_->get(k), acc);
+                recvbufs[p].resize(nbytes);
+                ts.emplace_back([&, p] {
+                    mesh_->send(p, acc.data_ptr(), nbytes);
+                    mesh_->recv(p, recvbufs[p].data(), nbytes);
+                });
+            }
+            for (auto& th : ts) th.join();
+            for (int p = 0; p < getSize(); ++p) {
+                if (p == getRank()) continue;
+                auto peer = bytes_to_cpu_like(recvbufs[p], acc);
                 cpu_reduce_(acc, peer, op);
             }
             if (op == c10d::ReduceOp::AVG) acc.div_(getSize());
@@ -115,13 +128,20 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     try {
         int root = opts.rootRank;
         for (auto& t : tensors) {
-            uint64_t s = next_seq_();
-            auto k = key("bc", s, root);
+            auto cpu = t.contiguous().cpu();
+            size_t nbytes = cpu.nbytes();
             if (getRank() == root) {
-                store_->set(k, tensor_to_bytes(t));
+                std::vector<std::thread> ts;
+                for (int p = 0; p < getSize(); ++p) {
+                    if (p == root) continue;
+                    ts.emplace_back([&, p] {
+                        mesh_->send(p, cpu.data_ptr(), nbytes);
+                    });
+                }
+                for (auto& th : ts) th.join();
             } else {
-                store_->wait({k}, opts_.timeout);
-                t.copy_(bytes_to_cpu_like(store_->get(k), t));
+                mesh_->recv(root, cpu.data_ptr(), nbytes);
+                t.copy_(cpu);
             }
         }
     } catch (...) {

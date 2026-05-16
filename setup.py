@@ -279,6 +279,7 @@ class MCCLBuildExt(build_ext):
 CPP_SOURCES = [
     "csrc/runtime/Rendezvous.cpp",
     "csrc/backend/WorkMCCL.cpp",
+    "csrc/backend/PeerMesh.cpp",
     "csrc/backend/ProcessGroupMCCL.cpp",
     "csrc/backend/Registration.cpp",
     "csrc/python/bindings.cpp",
