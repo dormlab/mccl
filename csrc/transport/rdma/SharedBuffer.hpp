@@ -45,6 +45,11 @@ public:
 
     /// Free all registrations and the backing buffer.
     void cleanup();
+
+private:
+    void* buf_ = nullptr;
+    size_t nbytes_ = 0;
+    std::vector<ibv_mr*> registrations_;
 };
 
 } // namespace distro

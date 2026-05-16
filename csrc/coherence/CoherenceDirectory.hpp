@@ -7,9 +7,9 @@
 #include <mutex>
 #include <bitset>
 
-namespace distro {
+#include "dmem/DistributedMemoryManager.hpp"
 
-static constexpr int MAX_NODES = 8;
+namespace distro {
 
 /// Per-page coherence state tracked at the home node.
 enum class CoherenceState : uint8_t {

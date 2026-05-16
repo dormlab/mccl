@@ -1,13 +1,14 @@
 #include "backend/ProcessGroupMCCL.hpp"
 #include "backend/WorkMCCL.hpp"
+#include "backend/PeerMesh.hpp"
 #include "runtime/Rendezvous.hpp"
 #include "common/Errors.hpp"
 
 #include <ATen/ATen.h>
 
-#ifdef DISTRO_HAS_METAL_KERNELS
-#include "metal/MetalKernels.hpp"
-#endif
+#include <cstring>
+#include <string>
+#include <thread>
 
 namespace distro {
 
@@ -22,16 +23,46 @@ c10::intrusive_ptr<c10d::Work> make_completed(
 
 c10::intrusive_ptr<c10d::Work> make_failed(
     c10d::OpType op, std::vector<at::Tensor> outputs,
-    const char* title, const std::string& msg) {
+    const char* title, std::exception_ptr eptr) {
     auto w = c10::make_intrusive<WorkMCCL>(op, std::move(outputs), title);
-    w->finishWithException(std::make_exception_ptr(MCCLError(msg)));
+    w->finishWithException(eptr);
     return w;
 }
 
 c10::intrusive_ptr<c10d::Work> make_unimplemented(
     c10d::OpType op, std::vector<at::Tensor> outputs, const char* title) {
     return make_failed(op, std::move(outputs), title,
-        std::string(title) + ": multi-rank path not yet wired to DMEM transport");
+        std::make_exception_ptr(MCCLError(
+            std::string(title) + ": not implemented")));
+}
+
+std::vector<uint8_t> tensor_to_bytes(const at::Tensor& t) {
+    auto c = t.contiguous().cpu();
+    std::vector<uint8_t> b(c.nbytes());
+    std::memcpy(b.data(), c.data_ptr(), b.size());
+    return b;
+}
+
+at::Tensor bytes_to_cpu_like(const std::vector<uint8_t>& b, const at::Tensor& tmpl) {
+    auto t = at::empty(tmpl.sizes(), tmpl.options().device(at::kCPU));
+    DISTRO_CHECK(b.size() == static_cast<size_t>(t.nbytes()), "size mismatch");
+    std::memcpy(t.data_ptr(), b.data(), b.size());
+    return t;
+}
+
+void cpu_reduce_(at::Tensor& dst, const at::Tensor& src, c10d::ReduceOp::RedOpType op) {
+    switch (op) {
+        case c10d::ReduceOp::SUM:
+        case c10d::ReduceOp::AVG:     dst.add_(src); break;
+        case c10d::ReduceOp::PRODUCT: dst.mul_(src); break;
+        case c10d::ReduceOp::MIN:     at::min_out(dst, dst, src); break;
+        case c10d::ReduceOp::MAX:     at::max_out(dst, dst, src); break;
+        default: throw MCCLError("unsupported ReduceOp");
+    }
+}
+
+std::string key(const char* op, uint64_t seq, int r) {
+    return std::string("mccl/") + op + "/" + std::to_string(seq) + "/" + std::to_string(r);
 }
 
 } // namespace
@@ -45,74 +76,79 @@ ProcessGroupMCCL::ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
     if (size > 1) {
         rendezvous_ = std::make_unique<Rendezvous>(
             store_, rank, size, opts_.timeout);
+        mesh_ = std::make_unique<PeerMesh>(
+            store_, rank, size, opts_.timeout);
     }
 }
 
 ProcessGroupMCCL::~ProcessGroupMCCL() = default;
 
-void ProcessGroupMCCL::ensure_metal_() {
-#ifdef DISTRO_HAS_METAL_KERNELS
-    if (!metal_inited_ && opts_.use_metal) {
-        metal_kernels_init();
-        metal_inited_ = true;
-    }
-#endif
-}
-
-void ProcessGroupMCCL::local_reduce_(at::Tensor& dst, const at::Tensor& src,
-                                     c10d::ReduceOp::RedOpType op) {
-#ifdef DISTRO_HAS_METAL_KERNELS
-    if (dst.device().is_mps() && src.device().is_mps() && opts_.use_metal) {
-        ensure_metal_();
-        metal_reduce_op(dst, src, op);
-        return;
-    }
-#endif
-    switch (op) {
-        case c10d::ReduceOp::SUM:
-        case c10d::ReduceOp::AVG:
-            dst.add_(src);
-            break;
-        case c10d::ReduceOp::PRODUCT:
-            dst.mul_(src);
-            break;
-        case c10d::ReduceOp::MIN:
-            at::min_out(dst, dst, src);
-            break;
-        case c10d::ReduceOp::MAX:
-            at::max_out(dst, dst, src);
-            break;
-        default:
-            throw MCCLError("unsupported ReduceOp");
-    }
-}
-
-void ProcessGroupMCCL::local_scale_(at::Tensor& t, double scale) {
-    if (scale == 1.0) return;
-#ifdef DISTRO_HAS_METAL_KERNELS
-    if (t.device().is_mps() && opts_.use_metal) {
-        ensure_metal_();
-        metal_scale_inplace(t, scale);
-        return;
-    }
-#endif
-    t.mul_(scale);
-}
-
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
-    std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& /*opts*/) {
+    std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     if (getSize() == 1) {
         return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
     }
-    return make_unimplemented(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
+    try {
+        auto op = opts.reduceOp;
+        for (auto& t : tensors) {
+            auto src = t.contiguous().cpu();
+            auto acc = src.is_same(t) ? src : src.clone();
+            size_t nbytes = acc.nbytes();
+            std::vector<at::Tensor> recvbufs(getSize());
+            std::vector<std::thread> ts;
+            ts.reserve(getSize() - 1);
+            for (int p = 0; p < getSize(); ++p) {
+                if (p == getRank()) continue;
+                recvbufs[p] = at::empty_like(acc);
+                ts.emplace_back([&, p] {
+                    mesh_->send(p, acc.data_ptr(), nbytes);
+                    mesh_->recv(p, recvbufs[p].data_ptr(), nbytes);
+                });
+            }
+            for (auto& th : ts) th.join();
+            for (int p = 0; p < getSize(); ++p) {
+                if (p == getRank()) continue;
+                cpu_reduce_(acc, recvbufs[p], op);
+            }
+            if (op == c10d::ReduceOp::AVG) acc.div_(getSize());
+            if (!acc.is_same(t)) t.copy_(acc);
+        }
+    } catch (...) {
+        return make_failed(c10d::OpType::ALLREDUCE, tensors,
+                           "mccl:allreduce", std::current_exception());
+    }
+    return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
-    std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& /*opts*/) {
+    std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
     if (getSize() == 1) {
         return make_completed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
     }
-    return make_unimplemented(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
+    try {
+        int root = opts.rootRank;
+        for (auto& t : tensors) {
+            auto cpu = t.contiguous().cpu();
+            size_t nbytes = cpu.nbytes();
+            if (getRank() == root) {
+                std::vector<std::thread> ts;
+                for (int p = 0; p < getSize(); ++p) {
+                    if (p == root) continue;
+                    ts.emplace_back([&, p] {
+                        mesh_->send(p, cpu.data_ptr(), nbytes);
+                    });
+                }
+                for (auto& th : ts) th.join();
+            } else {
+                mesh_->recv(root, cpu.data_ptr(), nbytes);
+                t.copy_(cpu);
+            }
+        }
+    } catch (...) {
+        return make_failed(c10d::OpType::BROADCAST, tensors,
+                           "mccl:broadcast", std::current_exception());
+    }
+    return make_completed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
@@ -126,8 +162,26 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         return make_completed(c10d::OpType::ALLGATHER,
                               output_tensors[0], "mccl:allgather");
     }
-    return make_unimplemented(c10d::OpType::ALLGATHER, input_tensors,
-                              "mccl:allgather");
+    try {
+        DISTRO_CHECK(input_tensors.size() == output_tensors.size(),
+                     "allgather input/output count mismatch");
+        for (size_t i = 0; i < input_tensors.size(); ++i) {
+            uint64_t s = next_seq_();
+            auto& outs = output_tensors[i];
+            DISTRO_CHECK(static_cast<int>(outs.size()) == getSize(),
+                         "allgather output list size != world");
+            store_->set(key("ag", s, getRank()), tensor_to_bytes(input_tensors[i]));
+            for (int p = 0; p < getSize(); ++p) {
+                auto k = key("ag", s, p);
+                if (p != getRank()) store_->wait({k}, opts_.timeout);
+                outs[p].copy_(bytes_to_cpu_like(store_->get(k), outs[p]));
+            }
+        }
+    } catch (...) {
+        return make_failed(c10d::OpType::ALLGATHER, input_tensors,
+                           "mccl:allgather", std::current_exception());
+    }
+    return make_completed(c10d::OpType::ALLGATHER, input_tensors, "mccl:allgather");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
@@ -138,8 +192,29 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
         return make_completed(c10d::OpType::_ALLGATHER_BASE,
                               {output_tensor}, "mccl:_allgather_base");
     }
-    return make_unimplemented(c10d::OpType::_ALLGATHER_BASE, {output_tensor},
-                              "mccl:_allgather_base");
+    try {
+        uint64_t s = next_seq_();
+        store_->set(key("agb", s, getRank()), tensor_to_bytes(input_tensor));
+        auto chunk_bytes = input_tensor.nbytes();
+        auto* dst = static_cast<uint8_t*>(output_tensor.contiguous().data_ptr());
+        auto cpu_out = at::empty(output_tensor.sizes(),
+                                 output_tensor.options().device(at::kCPU));
+        auto* cpu_dst = static_cast<uint8_t*>(cpu_out.data_ptr());
+        for (int p = 0; p < getSize(); ++p) {
+            auto k = key("agb", s, p);
+            if (p != getRank()) store_->wait({k}, opts_.timeout);
+            auto b = store_->get(k);
+            DISTRO_CHECK(b.size() == chunk_bytes, "_allgather_base chunk size mismatch");
+            std::memcpy(cpu_dst + p * chunk_bytes, b.data(), chunk_bytes);
+        }
+        output_tensor.copy_(cpu_out);
+        (void)dst;
+    } catch (...) {
+        return make_failed(c10d::OpType::_ALLGATHER_BASE, {output_tensor},
+                           "mccl:_allgather_base", std::current_exception());
+    }
+    return make_completed(c10d::OpType::_ALLGATHER_BASE,
+                          {output_tensor}, "mccl:_allgather_base");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
@@ -161,12 +236,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
     const c10d::BarrierOptions& /*opts*/) {
     if (getSize() > 1 && rendezvous_) {
         try {
-            rendezvous_->barrier("pg_barrier");
+            rendezvous_->barrier("pg_barrier_" + std::to_string(next_seq_()));
         } catch (...) {
-            auto w = c10::make_intrusive<WorkMCCL>(
-                c10d::OpType::BARRIER, std::vector<at::Tensor>{}, "mccl:barrier");
-            w->finishWithException(std::current_exception());
-            return w;
+            return make_failed(c10d::OpType::BARRIER, {},
+                               "mccl:barrier", std::current_exception());
         }
     }
     return make_completed(c10d::OpType::BARRIER, {}, "mccl:barrier");

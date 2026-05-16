@@ -277,38 +277,15 @@ class MCCLBuildExt(build_ext):
 
 
 CPP_SOURCES = [
-    # DMEM
-    "csrc/dmem/DistributedMemoryManager.cpp",
-    "csrc/dmem/MemoryCatalog.cpp",
-    # Coherence
-    "csrc/coherence/CoherenceProtocol.cpp",
-    "csrc/coherence/CoherenceDirectory.cpp",
-    # Runtime
-    "csrc/runtime/ClusterManager.cpp",
-    "csrc/runtime/Scheduler.cpp",
-    "csrc/runtime/DistributedMetalRuntime.cpp",
-    "csrc/runtime/ProgressEngine.cpp",
     "csrc/runtime/Rendezvous.cpp",
-    "csrc/runtime/Metrics.cpp",
-    "csrc/runtime/MemoryPool.cpp",
-    "csrc/runtime/MCCLDeviceMutex.cpp",
-    # RDMA transport
-    "csrc/transport/rdma/IbvWrapper.cpp",
-    "csrc/transport/rdma/RdmaConnection.cpp",
-    "csrc/transport/rdma/SharedBuffer.cpp",
-    # c10d Backend
     "csrc/backend/WorkMCCL.cpp",
+    "csrc/backend/PeerMesh.cpp",
     "csrc/backend/ProcessGroupMCCL.cpp",
     "csrc/backend/Registration.cpp",
-    # Python bindings
     "csrc/python/bindings.cpp",
 ]
 
-MM_SOURCES = [
-    "csrc/metal/MPSInterop.mm",
-    "csrc/metal/MetalKernels.mm",
-    "csrc/metal/EventSync.mm",
-]
+MM_SOURCES = []
 
 ext = Extension(
     name="distro._C",

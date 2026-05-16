@@ -1,9 +1,10 @@
 #include "backend/ProcessGroupMCCL.hpp"
 
-#include <pybind11/pybind11.h>
+#include <torch/extension.h>
 #include <pybind11/chrono.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
+
 
 #include <chrono>
 
@@ -19,23 +20,6 @@ namespace distro {
 ///   - `_create_process_group_mccl(store, rank, size, timeout)` factory
 ///     used by `torch.distributed.Backend.register_backend("mccl", ...)`.
 void register_mccl_backend(py::module_& m) {
-    py::class_<ProcessGroupMCCL,
-               c10d::Backend,
-               c10::intrusive_ptr<ProcessGroupMCCL>>(m, "ProcessGroupMCCL")
-        .def(py::init([](const c10::intrusive_ptr<c10d::Store>& store,
-                          int rank, int size,
-                          std::chrono::milliseconds timeout) {
-                 ProcessGroupMCCL::Options opts;
-                 opts.timeout = timeout;
-                 return c10::make_intrusive<ProcessGroupMCCL>(
-                     store, rank, size, opts);
-             }),
-             py::arg("store"),
-             py::arg("rank"),
-             py::arg("size"),
-             py::arg("timeout") = std::chrono::milliseconds(30 * 60 * 1000))
-        .def("get_backend_name", &ProcessGroupMCCL::getBackendName);
-
     m.def("_create_process_group_mccl",
           [](const c10::intrusive_ptr<c10d::Store>& store,
              int rank, int size,

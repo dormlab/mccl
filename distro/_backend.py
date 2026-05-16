@@ -6,9 +6,29 @@ work. It is idempotent — repeated imports do nothing after the first.
 from __future__ import annotations
 
 import datetime as _dt
+import os as _os
 import warnings as _warnings
 
 _REGISTERED = False
+
+DEFAULT_IFACE_PRIORITY = (
+    "10.",
+    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
+    "172.28.", "172.29.", "172.30.", "172.31.",
+    "192.168.",
+    "100.",
+    "169.254.",
+)
+
+
+def set_iface_priority(prefixes):
+    """Set the IPv4 prefix priority used to pick the best peer route.
+
+    Earlier prefixes win. Pass before init_process_group. Example:
+        distro.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
+    """
+    _os.environ["MCCL_IFACE_PRIORITY"] = ",".join(prefixes)
 
 
 def register() -> bool:
@@ -16,6 +36,8 @@ def register() -> bool:
     global _REGISTERED
     if _REGISTERED:
         return True
+
+    _os.environ.setdefault("MCCL_IFACE_PRIORITY", ",".join(DEFAULT_IFACE_PRIORITY))
 
     try:
         import torch.distributed as dist

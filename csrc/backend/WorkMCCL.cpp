@@ -10,13 +10,11 @@ namespace {
 c10::intrusive_ptr<c10::ivalue::Future> make_future(
     const std::vector<at::Tensor>& tensors) {
     std::vector<c10::Device> devices;
-    devices.reserve(tensors.size());
     for (const auto& t : tensors) {
-        devices.emplace_back(t.device());
+        if (t.device().has_index()) devices.emplace_back(t.device());
     }
-    auto future = c10::make_intrusive<c10::ivalue::Future>(
+    return c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()), devices);
-    return future;
 }
 
 } // namespace

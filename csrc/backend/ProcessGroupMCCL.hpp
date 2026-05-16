@@ -1,11 +1,12 @@
 #pragma once
 
 #include <torch/torch.h>
-#include <c10d/Backend.hpp>
-#include <c10d/Store.hpp>
-#include <c10d/Types.hpp>
-#include <c10d/Work.hpp>
+#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/Types.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -14,6 +15,7 @@
 namespace distro {
 
 class Rendezvous;
+class PeerMesh;
 
 /// MCCL c10d backend for Apple Silicon clusters.
 ///
@@ -26,13 +28,12 @@ class ProcessGroupMCCL : public c10d::Backend {
 public:
     struct Options {
         std::chrono::milliseconds timeout{30 * 60 * 1000};
-        bool use_metal = true;   // use Metal kernels for local reduction
     };
 
     ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
                      int rank,
                      int size,
-                     Options opts = {});
+                     Options opts);
 
     ~ProcessGroupMCCL() override;
 
@@ -86,17 +87,11 @@ private:
     c10::intrusive_ptr<c10d::Store> store_;
     Options opts_;
     std::unique_ptr<Rendezvous> rendezvous_;
-    bool metal_inited_ = false;
+    std::unique_ptr<PeerMesh> mesh_;
+    std::atomic<uint64_t> seq_{0};
 
-    /// Reduce `src` into `dst` in-place using Metal for MPS tensors and
-    /// ATen ops for CPU tensors.
-    void local_reduce_(at::Tensor& dst, const at::Tensor& src,
-                       c10d::ReduceOp::RedOpType op);
+    uint64_t next_seq_() { return seq_.fetch_add(1, std::memory_order_relaxed); }
 
-    /// Apply scaling (used to convert SUM -> AVG after a SUM ring step).
-    void local_scale_(at::Tensor& t, double scale);
-
-    void ensure_metal_();
 };
 
 } // namespace distro
