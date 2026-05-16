@@ -1,10 +1,10 @@
 #pragma once
 
 #include <torch/torch.h>
-#include <c10d/Backend.hpp>
-#include <c10d/Store.hpp>
-#include <c10d/Types.hpp>
-#include <c10d/Work.hpp>
+#include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/Types.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
 
 #include <atomic>
 #include <chrono>

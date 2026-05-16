@@ -78,7 +78,7 @@ inline void log_impl(LogLevel level, const char* file, int line,
 }
 
 #define MCCL_LOG(lvl, ...)                                             \
-    ::mccl::log_impl(::mccl::LogLevel::lvl, __FILE__, __LINE__, __VA_ARGS__)
+    ::distro::log_impl(::distro::LogLevel::lvl, __FILE__, __LINE__, __VA_ARGS__)
 
 #define DISTRO_TRACE(...) MCCL_LOG(TRACE, __VA_ARGS__)
 #define DISTRO_DEBUG(...) MCCL_LOG(DEBUG, __VA_ARGS__)

@@ -1,8 +1,8 @@
 #pragma once
 
 #include <torch/torch.h>
-#include <c10d/Work.hpp>
-#include <c10d/Types.hpp>
+#include <torch/csrc/distributed/c10d/Work.hpp>
+#include <torch/csrc/distributed/c10d/Types.hpp>
 
 #include <atomic>
 #include <chrono>

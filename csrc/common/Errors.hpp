@@ -50,7 +50,7 @@ public:
                      << __FILE__ << ":" << __LINE__;                    \
             std::string _extra = std::string(__VA_ARGS__);              \
             if (!_extra.empty()) _distro_ss << " — " << _extra;          \
-            throw ::mccl::MCCLError(_distro_ss.str());                   \
+            throw ::distro::MCCLError(_distro_ss.str());                   \
         }                                                               \
     } while (false)
 
@@ -61,7 +61,7 @@ public:
             _distro_ss << "Tensor check failed: " #cond;                 \
             std::string _extra = std::string(__VA_ARGS__);              \
             if (!_extra.empty()) _distro_ss << " — " << _extra;          \
-            throw ::mccl::TensorError(_distro_ss.str());                 \
+            throw ::distro::TensorError(_distro_ss.str());                 \
         }                                                               \
     } while (false)
 

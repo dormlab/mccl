@@ -1,7 +1,7 @@
 #pragma once
 
 #include <torch/torch.h>
-#include <c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
 #include <string>
 #include <vector>
 #include <chrono>
