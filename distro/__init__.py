@@ -65,6 +65,14 @@ if _platform_ok:
             metal_sync,
         )
         _C = True
+        try:
+            from distro._backend import register as _register_mccl_backend
+            _register_mccl_backend()
+        except Exception as _e:
+            warnings.warn(
+                f"failed to register mccl c10d backend: {_e}",
+                RuntimeWarning, stacklevel=2,
+            )
     except ImportError as e:
         warnings.warn(
             f"distro native extension not found: {e}",
