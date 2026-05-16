@@ -62,6 +62,23 @@ public:
         std::vector<std::vector<at::Tensor>>& input_tensors,
         const c10d::ReduceScatterOptions& opts = {}) override;
 
+    c10::intrusive_ptr<c10d::Work> _reduce_scatter_base(
+        at::Tensor& output_tensor,
+        at::Tensor& input_tensor,
+        const c10d::ReduceScatterOptions& opts = {}) override;
+
+    c10::intrusive_ptr<c10d::Work> alltoall_base(
+        at::Tensor& output_tensor,
+        at::Tensor& input_tensor,
+        std::vector<int64_t>& output_split_sizes,
+        std::vector<int64_t>& input_split_sizes,
+        const c10d::AllToAllOptions& opts = {}) override;
+
+    c10::intrusive_ptr<c10d::Work> alltoall(
+        std::vector<at::Tensor>& output_tensors,
+        std::vector<at::Tensor>& input_tensors,
+        const c10d::AllToAllOptions& opts = {}) override;
+
     c10::intrusive_ptr<c10d::Work> barrier(
         const c10d::BarrierOptions& opts = {}) override;
 
