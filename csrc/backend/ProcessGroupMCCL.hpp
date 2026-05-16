@@ -32,7 +32,7 @@ public:
     ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
                      int rank,
                      int size,
-                     Options opts = {});
+                     Options opts);
 
     ~ProcessGroupMCCL() override;
 
