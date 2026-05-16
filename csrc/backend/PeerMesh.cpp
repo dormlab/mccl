@@ -17,12 +17,32 @@ namespace distro {
 
 namespace {
 
+
+
+const std::vector<std::string>& prefix_priority() {
+    static const std::vector<std::string> v = [] {
+        const char* env = std::getenv("MCCL_IFACE_PRIORITY");
+        std::vector<std::string> out;
+        if (!env || !*env) return out;
+        std::string s = env;
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(',', i);
+            if (j == std::string::npos) j = s.size();
+            if (j > i) out.emplace_back(s.substr(i, j - i));
+            i = j + 1;
+        }
+        return out;
+    }();
+    return v;
+}
+
 int score(const std::string& ip) {
-    if (ip.rfind("192.168.10", 0) == 0) return 0;  // Thunderbolt /24s
-    if (ip.rfind("192.168.", 0) == 0)   return 1;  // LAN
-    if (ip.rfind("169.254.", 0) == 0)   return 4;  // link-local
-    if (ip.rfind("100.", 0) == 0)       return 2;  // Tailscale
-    return 3;
+    const auto& pri = prefix_priority();
+    for (size_t i = 0; i < pri.size(); i++) {
+        if (ip.rfind(pri[i], 0) == 0) return static_cast<int>(i);
+    }
+    return static_cast<int>(pri.size());
 }
 
 std::vector<std::string> local_ips() {

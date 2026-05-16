@@ -91,27 +91,27 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     try {
         auto op = opts.reduceOp;
         for (auto& t : tensors) {
-            auto acc = t.contiguous().cpu();
+            auto src = t.contiguous().cpu();
+            auto acc = src.is_same(t) ? src : src.clone();
             size_t nbytes = acc.nbytes();
-            std::vector<std::vector<uint8_t>> recvbufs(getSize());
+            std::vector<at::Tensor> recvbufs(getSize());
             std::vector<std::thread> ts;
             ts.reserve(getSize() - 1);
             for (int p = 0; p < getSize(); ++p) {
                 if (p == getRank()) continue;
-                recvbufs[p].resize(nbytes);
+                recvbufs[p] = at::empty_like(acc);
                 ts.emplace_back([&, p] {
                     mesh_->send(p, acc.data_ptr(), nbytes);
-                    mesh_->recv(p, recvbufs[p].data(), nbytes);
+                    mesh_->recv(p, recvbufs[p].data_ptr(), nbytes);
                 });
             }
             for (auto& th : ts) th.join();
             for (int p = 0; p < getSize(); ++p) {
                 if (p == getRank()) continue;
-                auto peer = bytes_to_cpu_like(recvbufs[p], acc);
-                cpu_reduce_(acc, peer, op);
+                cpu_reduce_(acc, recvbufs[p], op);
             }
             if (op == c10d::ReduceOp::AVG) acc.div_(getSize());
-            t.copy_(acc);
+            if (!acc.is_same(t)) t.copy_(acc);
         }
     } catch (...) {
         return make_failed(c10d::OpType::ALLREDUCE, tensors,

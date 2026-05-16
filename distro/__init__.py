@@ -22,6 +22,8 @@ def _check_platform() -> bool:
 
 _platform_ok = _check_platform()
 
+from distro._backend import set_iface_priority  # noqa: E402
+
 if _platform_ok:
     try:
         import distro._C  # noqa: F401
@@ -32,4 +34,4 @@ if _platform_ok:
                       RuntimeWarning, stacklevel=2)
 
 
-__all__ = ["__version__", "COMPATIBILITY_MATRIX", "DistroConfig"]
+__all__ = ["__version__", "COMPATIBILITY_MATRIX", "DistroConfig", "set_iface_priority"]
