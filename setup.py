@@ -296,6 +296,10 @@ CPP_SOURCES = [
     "csrc/transport/rdma/IbvWrapper.cpp",
     "csrc/transport/rdma/RdmaConnection.cpp",
     "csrc/transport/rdma/SharedBuffer.cpp",
+    # c10d Backend
+    "csrc/backend/WorkMCCL.cpp",
+    "csrc/backend/ProcessGroupMCCL.cpp",
+    "csrc/backend/Registration.cpp",
     # Python bindings
     "csrc/python/bindings.cpp",
 ]

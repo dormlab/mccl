@@ -8,6 +8,8 @@ namespace py = pybind11;
 
 namespace distro {
 
+void register_mccl_backend(py::module_& m);
+
 namespace {
 
 // Singleton DMEM instance for the process (one per node)
@@ -126,6 +128,9 @@ PYBIND11_MODULE(_C, m) {
 
     m.def("metal_sync", &metal_sync,
           "Block until all enqueued Metal commands complete.");
+
+    // ── c10d backend registration ──────────────────────────────────────
+    register_mccl_backend(m);
 }
 
 } // namespace distro
