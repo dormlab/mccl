@@ -86,7 +86,6 @@ private:
     c10::intrusive_ptr<c10d::Store> store_;
     Options opts_;
     std::unique_ptr<Rendezvous> rendezvous_;
-    std::vector<std::string> endpoints_;
     bool metal_inited_ = false;
 
     /// Reduce `src` into `dst` in-place using Metal for MPS tensors and

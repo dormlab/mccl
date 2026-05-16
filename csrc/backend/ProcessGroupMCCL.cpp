@@ -24,12 +24,14 @@ c10::intrusive_ptr<c10d::Work> make_failed(
     c10d::OpType op, std::vector<at::Tensor> outputs,
     const char* title, const std::string& msg) {
     auto w = c10::make_intrusive<WorkMCCL>(op, std::move(outputs), title);
-    try {
-        throw MCCLError(msg);
-    } catch (...) {
-        w->finishWithException(std::current_exception());
-    }
+    w->finishWithException(std::make_exception_ptr(MCCLError(msg)));
     return w;
+}
+
+c10::intrusive_ptr<c10d::Work> make_unimplemented(
+    c10d::OpType op, std::vector<at::Tensor> outputs, const char* title) {
+    return make_failed(op, std::move(outputs), title,
+        std::string(title) + ": multi-rank path not yet wired to DMEM transport");
 }
 
 } // namespace
@@ -43,9 +45,6 @@ ProcessGroupMCCL::ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
     if (size > 1) {
         rendezvous_ = std::make_unique<Rendezvous>(
             store_, rank, size, opts_.timeout);
-        // Endpoint exchange is a no-op placeholder until the DMEM transport
-        // is plumbed through; the rendezvous is constructed here so the
-        // Store handle's lifetime is tied to the PG.
     }
 }
 
@@ -100,20 +99,12 @@ void ProcessGroupMCCL::local_scale_(at::Tensor& t, double scale) {
     t.mul_(scale);
 }
 
-// ─── Collectives ──────────────────────────────────────────────────────────
-//
-// Single-rank world is a no-op fast path: input is already the result.
-// Multi-rank execution is gated behind the DMEM transport, which is wired
-// up in a follow-up change; for now we fail loudly with a clear message
-// instead of silently producing wrong results.
-
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& /*opts*/) {
     if (getSize() == 1) {
         return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
     }
-    return make_failed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce",
-        "multi-rank allreduce not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
@@ -121,8 +112,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     if (getSize() == 1) {
         return make_completed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
     }
-    return make_failed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast",
-        "multi-rank broadcast not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
@@ -136,8 +126,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         return make_completed(c10d::OpType::ALLGATHER,
                               output_tensors[0], "mccl:allgather");
     }
-    return make_failed(c10d::OpType::ALLGATHER, input_tensors, "mccl:allgather",
-        "multi-rank allgather not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::ALLGATHER, input_tensors,
+                              "mccl:allgather");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
@@ -148,9 +138,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
         return make_completed(c10d::OpType::_ALLGATHER_BASE,
                               {output_tensor}, "mccl:_allgather_base");
     }
-    return make_failed(c10d::OpType::_ALLGATHER_BASE, {output_tensor},
-        "mccl:_allgather_base",
-        "multi-rank _allgather_base not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::_ALLGATHER_BASE, {output_tensor},
+                              "mccl:_allgather_base");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
@@ -164,9 +153,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
         return make_completed(c10d::OpType::REDUCE_SCATTER,
                               output_tensors, "mccl:reduce_scatter");
     }
-    return make_failed(c10d::OpType::REDUCE_SCATTER, output_tensors,
-        "mccl:reduce_scatter",
-        "multi-rank reduce_scatter not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::REDUCE_SCATTER, output_tensors,
+                              "mccl:reduce_scatter");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
@@ -186,14 +174,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     std::vector<at::Tensor>& tensors, int /*dst_rank*/, int /*tag*/) {
-    return make_failed(c10d::OpType::SEND, tensors, "mccl:send",
-        "point-to-point send not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::SEND, tensors, "mccl:send");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     std::vector<at::Tensor>& tensors, int /*src_rank*/, int /*tag*/) {
-    return make_failed(c10d::OpType::RECV, tensors, "mccl:recv",
-        "point-to-point recv not yet wired to DMEM transport");
+    return make_unimplemented(c10d::OpType::RECV, tensors, "mccl:recv");
 }
 
 c10::intrusive_ptr<c10d::Backend> ProcessGroupMCCL::create(
