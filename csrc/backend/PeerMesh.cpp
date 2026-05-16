@@ -45,6 +45,16 @@ int score(const std::string& ip) {
     return static_cast<int>(pri.size());
 }
 
+std::string subnet24(const std::string& ip) {
+    int dots = 0;
+    for (size_t i = 0; i < ip.size(); i++) {
+        if (ip[i] == '.') {
+            if (++dots == 3) return ip.substr(0, i);
+        }
+    }
+    return ip;
+}
+
 std::vector<std::string> local_ips() {
     std::vector<std::string> v;
     struct ifaddrs* ifa = nullptr;
@@ -124,6 +134,9 @@ PeerMesh::PeerMesh(c10::intrusive_ptr<c10d::Store> store,
     int port = ntohs(addr.sin_port);
 
     auto ips = local_ips();
+    std::vector<std::string> my_subnets;
+    my_subnets.reserve(ips.size());
+    for (const auto& ip : ips) my_subnets.emplace_back(subnet24(ip));
     std::ostringstream os;
     for (size_t i = 0; i < ips.size(); i++) {
         if (i) os << ",";
@@ -176,7 +189,16 @@ PeerMesh::PeerMesh(c10::intrusive_ptr<c10d::Store> store,
             cands.emplace_back(s.substr(i, j - i));
             i = j + 1;
         }
-        std::sort(cands.begin(), cands.end(),
+        std::vector<std::string> reachable;
+        reachable.reserve(cands.size());
+        for (const auto& ip : cands) {
+            auto sub = subnet24(ip);
+            for (const auto& mine : my_subnets) {
+                if (sub == mine) { reachable.push_back(ip); break; }
+            }
+        }
+        if (reachable.empty()) reachable = cands;
+        std::sort(reachable.begin(), reachable.end(),
                   [](const std::string& a, const std::string& b) {
                       return score(a) < score(b);
                   });
@@ -184,7 +206,7 @@ PeerMesh::PeerMesh(c10::intrusive_ptr<c10d::Store> store,
         int fd = -1;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
         while (fd < 0 && std::chrono::steady_clock::now() < deadline) {
-            for (auto& ip : cands) {
+            for (auto& ip : reachable) {
                 int s_fd = ::socket(AF_INET, SOCK_STREAM, 0);
                 if (s_fd < 0) continue;
                 sockaddr_in a{};
