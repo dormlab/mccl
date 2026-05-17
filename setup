@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# Bootstrap mccl on this machine.
+#   1. require Apple Silicon + macOS
+#   2. require Xcode CLI tools (offer to install)
+#   3. build + install mccl as editable
+#   4. install pytest deps
+#   5. run `mccl check` to verify TB + Tailscale
+#
+# Run once per machine. Idempotent.
+
+set -e
+
+cd "$(dirname "$0")"
+
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+if [[ "$(uname)" != "Darwin" ]]; then
+    red "mccl requires macOS; this is $(uname)."; exit 1
+fi
+if [[ "$(uname -m)" != "arm64" ]]; then
+    red "mccl requires Apple Silicon (arm64); this is $(uname -m)."; exit 1
+fi
+
+if ! xcrun --show-sdk-path >/dev/null 2>&1; then
+    yellow "Xcode CLI tools missing. Running xcode-select --install..."
+    xcode-select --install
+    red "Re-run ./setup after the installer finishes."; exit 1
+fi
+
+PY=${PYTHON:-python3}
+if ! "$PY" -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"; then
+    red "Need Python >= 3.11; $PY is $($PY --version 2>&1)"; exit 1
+fi
+
+green "==> Installing mccl (editable build)"
+"$PY" -m pip install --quiet --no-build-isolation -e .
+
+green "==> Installing test deps"
+"$PY" -m pip install --quiet pytest pytest-timeout
+
+green "==> Verifying environment"
+"$PY" -m mccl.check || {
+    yellow "Some required checks failed. Configure Thunderbolt Bridge IPs and re-run."
+    exit 1
+}
+
+green "==> Setup complete."
+echo
+echo "Next steps:"
+echo "  Run unit tests:        $PY -m pytest tests/test_smoke.py"
+echo "  Run collectives:       MCCL_TEST_WORLD=2 $PY -m pytest tests/collectives/"
+echo "  Run on N ranks:        MCCL_TEST_WORLD=N $PY -m pytest tests/collectives/"
