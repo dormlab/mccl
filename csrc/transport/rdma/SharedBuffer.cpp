@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <utility>
 
-namespace distro {
+namespace mccl {
 
 static size_t page_size() {
     static const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
@@ -97,4 +97,4 @@ ibv_sge SharedBuffer::to_sge(ibv_mr* mr) const {
     return to_sge(mr, 0, static_cast<uint32_t>(nbytes_));
 }
 
-} // namespace distro
+} // namespace mccl

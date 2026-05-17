@@ -5,7 +5,7 @@
 #include <string>
 #include "common/Errors.hpp"
 
-namespace distro {
+namespace mccl {
 
 inline void check_single_tensor(const at::Tensor& tensor) {
     DISTRO_CHECK_TENSOR(
@@ -57,4 +57,4 @@ inline size_t tensor_nbytes(const at::Tensor& tensor) {
     return static_cast<size_t>(tensor.numel()) * tensor.element_size();
 }
 
-} // namespace distro
+} // namespace mccl

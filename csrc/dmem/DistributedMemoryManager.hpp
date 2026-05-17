@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <future>
 
-namespace distro {
+namespace mccl {
 
 static constexpr int MAX_NODES = 8;
 
@@ -208,4 +208,4 @@ private:
     Stats stats_;
 };
 
-} // namespace distro
+} // namespace mccl

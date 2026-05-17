@@ -10,9 +10,9 @@
 
 namespace py = pybind11;
 
-namespace distro {
+namespace mccl {
 
-/// Called by `distro._C._register_mccl_backend(module)` so the pybind11
+/// Called by `mccl._C._register_mccl_backend(module)` so the pybind11
 /// module that owns the symbols is the same one Python imports.
 ///
 /// Exposes:
@@ -37,4 +37,4 @@ void register_mccl_backend(py::module_& m) {
           "Factory used by torch.distributed.Backend.register_backend('mccl').");
 }
 
-} // namespace distro
+} // namespace mccl

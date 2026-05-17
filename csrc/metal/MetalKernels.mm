@@ -12,7 +12,7 @@
 #include "common/TensorChecks.hpp"
 #include <c10d/Types.hpp>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -191,7 +191,7 @@ void metal_kernels_init() {
 
     @autoreleasepool {
         c.device = (__bridge id<MTLDevice>)get_mtl_device();
-        c.queue  = (__bridge id<MTLCommandQueue>)get_distro_command_queue();
+        c.queue  = (__bridge id<MTLCommandQueue>)get_mccl_command_queue();
 
         NSError* err = nil;
         NSFileManager* fm = [NSFileManager defaultManager];
@@ -218,10 +218,10 @@ void metal_kernels_init() {
         if (dladdr((void*)metal_kernels_init, &dl_info) && dl_info.dli_fname) {
             NSString* soPath = @(dl_info.dli_fname);
             soDir = [soPath stringByDeletingLastPathComponent];
-            [metallib_search addObject:[soDir stringByAppendingPathComponent:@"distro_shaders.metallib"]];
+            [metallib_search addObject:[soDir stringByAppendingPathComponent:@"mccl_shaders.metallib"]];
         }
 
-        NSString* bundlePath = [[NSBundle mainBundle] pathForResource:@"distro_shaders"
+        NSString* bundlePath = [[NSBundle mainBundle] pathForResource:@"mccl_shaders"
                                                                ofType:@"metallib"];
         if (bundlePath) [metallib_search addObject:bundlePath];
 
@@ -272,7 +272,7 @@ void metal_kernels_init() {
             }
 
             DISTRO_CHECK(srcPath != nil,
-                "Cannot find shaders.metal or distro_shaders.metallib. "
+                "Cannot find shaders.metal or mccl_shaders.metallib. "
                 "Set DISTRO_SHADER_PATH env var.");
 
             NSString* src = [NSString stringWithContentsOfFile:srcPath
@@ -344,7 +344,7 @@ void metal_accumulate_chunk(const at::Tensor& dst, const at::Tensor& src) {
     bool aligned = binary_vector_aligned(dst_view, src_view, dst.scalar_type());
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "distro_accumulate");
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_accumulate");
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -377,7 +377,7 @@ void metal_scale_inplace(const at::Tensor& buf, double scale) {
     bool aligned = is_vector_aligned(view, buf.scalar_type());
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "distro_scale");
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_scale");
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -425,7 +425,7 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
     bool aligned = binary_vector_aligned(dst_view, src_view, dst.scalar_type());
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "distro_accumulate_scale");
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_accumulate_scale");
 
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -497,7 +497,7 @@ void metal_elementwise_min(const at::Tensor& dst, const at::Tensor& src) {
     DISTRO_CHECK(pso != nil,
                "No Metal min pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    dispatch_binary_op(pso, dst, src, "distro_min");
+    dispatch_binary_op(pso, dst, src, "mccl_min");
 }
 
 void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
@@ -510,7 +510,7 @@ void metal_elementwise_max(const at::Tensor& dst, const at::Tensor& src) {
     DISTRO_CHECK(pso != nil,
                "No Metal max pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    dispatch_binary_op(pso, dst, src, "distro_max");
+    dispatch_binary_op(pso, dst, src, "mccl_max");
 }
 
 void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
@@ -523,7 +523,7 @@ void metal_elementwise_product(const at::Tensor& dst, const at::Tensor& src) {
     DISTRO_CHECK(pso != nil,
                "No Metal product pipeline for dtype " +
                std::string(at::toString(dst.scalar_type())));
-    dispatch_binary_op(pso, dst, src, "distro_product");
+    dispatch_binary_op(pso, dst, src, "mccl_product");
 }
 
 void metal_reduce_op(const at::Tensor& dst, const at::Tensor& src,
@@ -561,7 +561,7 @@ void metal_begin_batch(const char* label) {
     DISTRO_CHECK(c.batch_cmd == nil, "Metal batch already active");
     @autoreleasepool {
         c.batch_cmd = [c.queue commandBuffer];
-        c.batch_cmd.label = @(label ? label : "distro_batch");
+        c.batch_cmd.label = @(label ? label : "mccl_batch");
     }
 }
 
@@ -575,4 +575,4 @@ void metal_end_batch() {
     }
 }
 
-} // namespace distro
+} // namespace mccl

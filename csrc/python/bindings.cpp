@@ -2,7 +2,7 @@
 
 namespace py = pybind11;
 
-namespace distro {
+namespace mccl {
 
 void register_mccl_backend(py::module_& m);
 
@@ -11,4 +11,4 @@ PYBIND11_MODULE(_C, m) {
     register_mccl_backend(m);
 }
 
-} // namespace distro
+} // namespace mccl

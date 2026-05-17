@@ -13,7 +13,7 @@
 #include <thread>
 #include <unistd.h>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -262,4 +262,4 @@ void PeerMesh::recv(int peer, void* buf, size_t len) {
     DISTRO_CHECK(read_all(peer_fds_[peer], buf, len), "PeerMesh: recv failed");
 }
 
-} // namespace distro
+} // namespace mccl

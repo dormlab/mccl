@@ -9,7 +9,7 @@
 #include <atomic>
 #include <cstdint>
 
-namespace distro {
+namespace mccl {
 
 // Forward declaration
 class Metrics;
@@ -70,4 +70,4 @@ private:
     Metrics* metrics_; // Not owned
 };
 
-} // namespace distro
+} // namespace mccl

@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace distro {
+namespace mccl {
 
 struct MPSBufferView {
     void* mtl_buffer;       // id<MTLBuffer> — stored as void* for C++ header
@@ -30,7 +30,7 @@ void mps_stream_sync();
 
 /// Drain only the MCCL command queue (blocks until all committed MCCL
 /// command buffers complete). Does NOT flush the PyTorch MPS stream.
-void distro_queue_drain();
+void mccl_queue_drain();
 
 /// Event-based MPS sync for compute-communication overlap.
 /// Non-blocking: encode signal + commit on PyTorch's MPS command buffer.
@@ -74,6 +74,6 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor);
 void* get_mtl_device();
 
 /// Get or create a dedicated MTLCommandQueue for MCCL operations.
-void* get_distro_command_queue();
+void* get_mccl_command_queue();
 
-} // namespace distro
+} // namespace mccl

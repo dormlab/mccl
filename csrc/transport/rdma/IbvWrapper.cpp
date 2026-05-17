@@ -4,7 +4,7 @@
 #include <dlfcn.h>
 #include <mutex>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -95,4 +95,4 @@ bool ibv_is_available() {
     return ibv() != nullptr;
 }
 
-} // namespace distro
+} // namespace mccl

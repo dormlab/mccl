@@ -42,6 +42,10 @@ dev = [
 include = ["mccl*"]
 
 [tool.pytest.ini_options]
-addopts = "--tb=short --capture=no --log-cli-level=WARNING"
-log_file = "test_failures.log"
-log_file_level = "DEBUG"
+testpaths = ["tests"]
+addopts = "--tb=short --strict-markers -m 'not multinode and not bench'"
+markers = [
+    "slow: tests that take > 5s",
+    "bench: perf benchmarks (opt-in)",
+    "multinode: requires multi-host setup",
+]

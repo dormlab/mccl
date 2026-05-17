@@ -1,0 +1,7 @@
+
+__pycache__/
+*.pyc
+mccl/_C*.so
+mccl/*.metallib
+mccl.egg-info/
+experiments/

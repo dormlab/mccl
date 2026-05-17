@@ -6,7 +6,7 @@
 #include <vector>
 #include <chrono>
 
-namespace distro {
+namespace mccl {
 
 /// Store-based rendezvous: exchange transport endpoints among all ranks.
 ///
@@ -24,7 +24,7 @@ public:
     std::vector<std::string> exchange_endpoints(const std::string& my_endpoint);
 
     /// Store-backed barrier — all ranks must call before any can proceed.
-    void barrier(const std::string& tag = "distro_barrier");
+    void barrier(const std::string& tag = "mccl_barrier");
 
 private:
     c10::intrusive_ptr<c10d::Store> store_;
@@ -36,4 +36,4 @@ private:
     static std::string barrier_key(const std::string& tag, int rank);
 };
 
-} // namespace distro
+} // namespace mccl

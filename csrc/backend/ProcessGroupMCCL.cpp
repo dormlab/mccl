@@ -10,7 +10,7 @@
 #include <string>
 #include <thread>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -519,4 +519,4 @@ c10::intrusive_ptr<c10d::Backend> ProcessGroupMCCL::create(
     return c10::make_intrusive<ProcessGroupMCCL>(store, rank, size, opts);
 }
 
-} // namespace distro
+} // namespace mccl

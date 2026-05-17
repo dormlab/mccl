@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-namespace distro {
+namespace mccl {
 
 class Rendezvous;
 class PeerMesh;
@@ -111,4 +111,4 @@ private:
 
 };
 
-} // namespace distro
+} // namespace mccl

@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <chrono>
 
-namespace distro {
+namespace mccl {
 
 static uint64_t now_us() {
     auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -400,4 +400,4 @@ void ClusterManager::scheduler_loop() {
     }
 }
 
-} // namespace distro
+} // namespace mccl

@@ -13,7 +13,7 @@
 #include <memory>
 #include <chrono>
 
-namespace distro {
+namespace mccl {
 
 static constexpr int MAX_CLUSTER_NODES = 8;
 
@@ -155,4 +155,4 @@ private:
     std::atomic<bool> running_{false};
 };
 
-} // namespace distro
+} // namespace mccl

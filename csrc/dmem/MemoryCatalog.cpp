@@ -4,7 +4,7 @@
 #include <cstring>
 #include <algorithm>
 
-namespace distro {
+namespace mccl {
 
 void MemoryCatalog::upsert(uint32_t region_id, const RegionDirectoryEntry& entry) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -94,4 +94,4 @@ size_t MemoryCatalog::local_entry_count() const {
     return count;
 }
 
-} // namespace distro
+} // namespace mccl

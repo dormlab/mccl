@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace distro {
+namespace mccl {
 
 /// Coherence protocol opcodes — delivered via RDMA write_with_imm.
 ///
@@ -61,4 +61,4 @@ inline uint64_t page_index(uint64_t offset) {
 /// Size of the coherence message buffer per peer (1 page).
 static constexpr size_t COHERENCE_MSG_BUF_SIZE = COHERENCE_PAGE_SIZE;
 
-} // namespace distro
+} // namespace mccl

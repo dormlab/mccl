@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 @dataclasses.dataclass
 class DistroConfig:
-    """All distro tunables in one place."""
+    """All mccl tunables in one place."""
 
     # ── Cluster ─────────────────────────────────────────────────────────
     node_id: int = 0

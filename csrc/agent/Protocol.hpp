@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace distro {
+namespace mccl {
 
 /// Control protocol between head node and mini agents over TCP.
 ///
@@ -83,4 +83,4 @@ struct StatsResponse {
     static constexpr size_t WIRE_SIZE = 8 + 8 + 8 + 8 + 4 + 8 + 4 + 1;
 };
 
-} // namespace distro
+} // namespace mccl

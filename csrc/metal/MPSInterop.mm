@@ -18,7 +18,7 @@ namespace at::mps {
     }
 }
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -245,7 +245,7 @@ void* get_mtl_device() {
     return (__bridge void*)cached_device();
 }
 
-void* get_distro_command_queue() {
+void* get_mccl_command_queue() {
     return (__bridge void*)cached_queue();
 }
 
@@ -308,7 +308,7 @@ void mps_stream_sync() {
     torch::mps::synchronize();
 }
 
-void distro_queue_drain() {
+void mccl_queue_drain() {
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
         [cmd commit];
@@ -318,7 +318,7 @@ void distro_queue_drain() {
 
 void mps_sync() {
     mps_stream_sync();
-    distro_queue_drain();
+    mccl_queue_drain();
 }
 
 uint64_t mps_event_sync_nonblocking() {
@@ -354,7 +354,7 @@ StagingBuffer stage_for_send(const at::Tensor& tensor) {
     check_single_tensor(tensor);
 
     mps_stream_sync();
-    distro_queue_drain();
+    mccl_queue_drain();
 
     MPSBufferView view = extract_mps_buffer(tensor);
 
@@ -422,4 +422,4 @@ void unstage_from_recv(const at::Tensor& tensor, const void* src, size_t nbytes)
     chunked_blit_from_staging(blit_src, nbytes, dst_buf, view.byte_offset);
 }
 
-} // namespace distro
+} // namespace mccl

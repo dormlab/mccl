@@ -6,7 +6,7 @@
 #include <cstring>
 #include <vector>
 
-namespace distro {
+namespace mccl {
 
 struct IbvFunctions;
 
@@ -115,4 +115,4 @@ private:
     ibv_qp*      qp_  = nullptr;
 };
 
-} // namespace distro
+} // namespace mccl

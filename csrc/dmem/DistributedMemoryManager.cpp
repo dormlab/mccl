@@ -5,7 +5,7 @@
 #include <cstring>
 #include <algorithm>
 
-namespace distro {
+namespace mccl {
 
 // ── Construction / destruction ────────────────────────────────────────────
 
@@ -526,4 +526,4 @@ void DistributedMemoryManager::poller_loop() {
     DISTRO_INFO("DMEM: poller loop exiting");
 }
 
-} // namespace distro
+} // namespace mccl

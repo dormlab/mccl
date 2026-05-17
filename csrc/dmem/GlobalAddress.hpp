@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstring>
 
-namespace distro {
+namespace mccl {
 
 /// Global address: uniquely identifies a byte range in the cluster.
 ///
@@ -83,4 +83,4 @@ struct AddrResolution {
     uint64_t length       = 0;         // Region length for bounds checking
 };
 
-} // namespace distro
+} // namespace mccl

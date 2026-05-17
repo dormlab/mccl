@@ -6,7 +6,7 @@
 #include <vector>
 #include <memory>
 
-namespace distro {
+namespace mccl {
 
 /// Reusable staging buffer pool.
 ///
@@ -78,4 +78,4 @@ using SharedPooledBuffer = std::shared_ptr<PooledBuffer>;
 /// Global staging pool singleton.
 MemoryPool& staging_memory_pool();
 
-} // namespace distro
+} // namespace mccl

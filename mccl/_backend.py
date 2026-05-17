@@ -26,7 +26,7 @@ def set_iface_priority(prefixes):
     """Set the IPv4 prefix priority used to pick the best peer route.
 
     Earlier prefixes win. Pass before init_process_group. Example:
-        distro.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
+        mccl.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
     """
     _os.environ["MCCL_IFACE_PRIORITY"] = ",".join(prefixes)
 
@@ -47,10 +47,10 @@ def register() -> bool:
         return False
 
     try:
-        from distro._C import _create_process_group_mccl
+        from mccl._C import _create_process_group_mccl
     except ImportError as e:
         _warnings.warn(
-            f"distro._C native extension missing _create_process_group_mccl: {e}",
+            f"mccl._C native extension missing _create_process_group_mccl: {e}",
             RuntimeWarning, stacklevel=2)
         return False
 

@@ -14,7 +14,7 @@
 #include <chrono>
 #include <algorithm>
 
-namespace distro {
+namespace mccl {
 
 // ── Construction / destruction ──────────────────────────────────────────────
 
@@ -427,4 +427,4 @@ void DistributedMetalRuntime::disconnect_agent(uint16_t node_id) {
     }
 }
 
-} // namespace distro
+} // namespace mccl

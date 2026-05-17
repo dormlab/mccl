@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace distro {
+namespace mccl {
 
 /// Page-aligned buffer registered with one or more RDMA protection domains.
 ///
@@ -52,4 +52,4 @@ private:
     std::vector<ibv_mr*> registrations_;
 };
 
-} // namespace distro
+} // namespace mccl

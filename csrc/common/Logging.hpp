@@ -7,7 +7,7 @@
 #include <mutex>
 #include <string>
 
-namespace distro {
+namespace mccl {
 
 enum class LogLevel : int {
     TRACE = 0,
@@ -78,7 +78,7 @@ inline void log_impl(LogLevel level, const char* file, int line,
 }
 
 #define MCCL_LOG(lvl, ...)                                             \
-    ::distro::log_impl(::distro::LogLevel::lvl, __FILE__, __LINE__, __VA_ARGS__)
+    ::mccl::log_impl(::mccl::LogLevel::lvl, __FILE__, __LINE__, __VA_ARGS__)
 
 #define DISTRO_TRACE(...) MCCL_LOG(TRACE, __VA_ARGS__)
 #define DISTRO_DEBUG(...) MCCL_LOG(DEBUG, __VA_ARGS__)
@@ -101,4 +101,4 @@ inline void log_impl(LogLevel level, const char* file, int line,
         std::terminate();                                              \
     } while (false)
 
-} // namespace distro
+} // namespace mccl
