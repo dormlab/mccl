@@ -13,7 +13,7 @@
 On every machine:
 
 1. **Tailscale** (recommended). Install from https://tailscale.com/download/macos, sign in, confirm with `tailscale status`.
-2. **Thunderbolt Bridge IPs**. Plug TB cables to your peers, then System Settings → Network → Thunderbolt Bridge (or each individual TB port) → Manually → assign a `/24` per pair, e.g. lexie↔derek on `192.168.102.0/24`, lexie↔amelia on `192.168.103.0/24`. Apply, repeat on each end.
+2. **Thunderbolt Bridge IPs**. Plug TB cables to your peers, then System Settings → Network → Thunderbolt Bridge (or each individual TB port) → Manually → assign a `/24` per pair, e.g. the first cable on `192.168.101.0/24`, the second on `192.168.102.0/24`. Apply, repeat on each end.
 3. **Xcode CLI tools**: `xcode-select --install`.
 4. **Install mccl**:
    ```bash
@@ -34,8 +34,8 @@ On every machine:
 mccl --test                           # unit + integration via mp.spawn
 
 # multi-host bench (one command per machine)
-RANK=$N WORLD_SIZE=3 MASTER_ADDR=192.168.103.2 MASTER_PORT=29500 \
-  python tests/multinode/bench.py --rank $N --world 3 --master 192.168.103.2
+RANK=$N WORLD_SIZE=3 MASTER_ADDR=<rank0-tb-ip> MASTER_PORT=29500 \
+  python tests/multinode/bench.py --rank $N --world 3 --master <rank0-tb-ip>
 ```
 
 Demo: https://github.com/user-attachments/assets/21865149-b077-4b65-93cc-f9e319ff0328

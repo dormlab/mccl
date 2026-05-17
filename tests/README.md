@@ -64,6 +64,6 @@ That's it. If a new golden is needed, add it in `conftest.py` next to the others
 `tests/multinode/bench.py` is the existing cross-machine runner. Launch one process per rank with `MASTER_ADDR`, `MASTER_PORT`, `RANK`, `WORLD_SIZE` env vars set. Example for 3 minis (run on each):
 
 ```
-MASTER_ADDR=192.168.103.2 MASTER_PORT=29500 RANK=$N WORLD_SIZE=3 \
-  python tests/multinode/bench.py --rank $N --world 3 --master 192.168.103.2
+MASTER_ADDR=<rank0-tb-ip> MASTER_PORT=29500 RANK=$N WORLD_SIZE=3 \
+  python tests/multinode/bench.py --rank $N --world 3 --master <rank0-tb-ip>
 ```
