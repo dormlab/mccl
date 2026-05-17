@@ -1,7 +1,7 @@
 #include "coherence/CoherenceDirectory.hpp"
 #include "common/Logging.hpp"
 
-namespace distro {
+namespace mccl {
 
 DirectoryEntry& CoherenceDirectory::get_or_create(uint32_t region_id,
                                                     uint64_t page_idx) {
@@ -40,4 +40,4 @@ size_t CoherenceDirectory::page_count() const {
     return entries_.size();
 }
 
-} // namespace distro
+} // namespace mccl

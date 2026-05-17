@@ -5,7 +5,7 @@
 #include <cstring>
 #include <algorithm>
 
-namespace distro {
+namespace mccl {
 
 // ── Construction / destruction ────────────────────────────────────────────
 
@@ -414,4 +414,4 @@ void CoherenceProtocol::untrack_page(GlobalAddress page) {
     local_cache_.erase(page.pack());
 }
 
-} // namespace distro
+} // namespace mccl

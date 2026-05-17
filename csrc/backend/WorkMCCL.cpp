@@ -3,7 +3,7 @@
 #include <ATen/core/ivalue.h>
 #include <c10/util/intrusive_ptr.h>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -103,4 +103,4 @@ void WorkMCCL::finishWithException(std::exception_ptr eptr) {
     cv_.notify_all();
 }
 
-} // namespace distro
+} // namespace mccl

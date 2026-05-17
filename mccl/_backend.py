@@ -26,7 +26,7 @@ def set_iface_priority(prefixes):
     """Set the IPv4 prefix priority used to pick the best peer route.
 
     Earlier prefixes win. Pass before init_process_group. Example:
-        distro.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
+        mccl.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
     """
     _os.environ["MCCL_IFACE_PRIORITY"] = ",".join(prefixes)
 
@@ -47,10 +47,10 @@ def register() -> bool:
         return False
 
     try:
-        from distro._C import _create_process_group_mccl
+        from mccl._C import _create_process_group_mccl
     except ImportError as e:
         _warnings.warn(
-            f"distro._C native extension missing _create_process_group_mccl: {e}",
+            f"mccl._C native extension missing _create_process_group_mccl: {e}",
             RuntimeWarning, stacklevel=2)
         return False
 
@@ -58,7 +58,12 @@ def register() -> bool:
         td = timeout if isinstance(timeout, _dt.timedelta) else _dt.timedelta(seconds=1800)
         return _create_process_group_mccl(prefix_store, rank, world_size, td)
 
-    # Newer torch (≥2.1) accepts a `devices` kwarg; fall back if not.
+    # MCCL is MPS-only — the PG body runs Metal kernels and rejects CPU tensors
+    # via check_mps_ (see ProcessGroupMCCL.cpp). "cpu" stays in the device list
+    # purely as a dispatcher-routing artifact: MPSFallback.cpp redispatches the
+    # c10d ops from the MPS key into the CPU key, where torch ships a generic
+    # shim that pulls the ProcessGroup off the op stack and calls our PG. No
+    # CPU compute runs through MCCL.
     try:
         dist.Backend.register_backend("mccl", _create, devices=["cpu", "mps"])
     except TypeError:

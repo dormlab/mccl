@@ -10,7 +10,7 @@
 #include <future>
 #include <unordered_map>
 
-namespace distro {
+namespace mccl {
 
 /// Distributed Metal Runtime — presents a cluster as a single logical GPU.
 ///
@@ -113,4 +113,4 @@ private:
     std::vector<uint16_t> node_ids_;
 };
 
-} // namespace distro
+} // namespace mccl

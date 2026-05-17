@@ -17,7 +17,7 @@
 #include <vector>
 #include <csignal>
 
-namespace distro {
+namespace mccl {
 
 static std::atomic<bool> g_running{true};
 static std::unique_ptr<DistributedMemoryManager> g_dmem;
@@ -241,10 +241,10 @@ int agent_main(int argc, char* argv[]) {
     return 0;
 }
 
-} // namespace distro
+} // namespace mccl
 
 #ifndef DISTRO_HEAD_BUILD
 int main(int argc, char* argv[]) {
-    return distro::agent_main(argc, argv);
+    return mccl::agent_main(argc, argv);
 }
 #endif

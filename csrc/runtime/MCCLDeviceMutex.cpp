@@ -1,10 +1,10 @@
 #include "runtime/MCCLDeviceMutex.hpp"
 
-namespace distro {
+namespace mccl {
 
-std::recursive_mutex& distro_device_ops_mutex() {
+std::recursive_mutex& mccl_device_ops_mutex() {
     static std::recursive_mutex m;
     return m;
 }
 
-} // namespace distro
+} // namespace mccl

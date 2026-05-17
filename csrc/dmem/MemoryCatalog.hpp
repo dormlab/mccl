@@ -7,7 +7,7 @@
 #include <mutex>
 #include <atomic>
 
-namespace distro {
+namespace mccl {
 
 /// Per-node region directory entry (published via well-known RDMA buffer).
 ///
@@ -92,4 +92,4 @@ inline uint64_t catalog_key(uint16_t node_id, uint32_t region_id) {
            (static_cast<uint64_t>(region_id) << 16);
 }
 
-} // namespace distro
+} // namespace mccl

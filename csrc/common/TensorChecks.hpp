@@ -5,7 +5,7 @@
 #include <string>
 #include "common/Errors.hpp"
 
-namespace distro {
+namespace mccl {
 
 inline void check_single_tensor(const at::Tensor& tensor) {
     DISTRO_CHECK_TENSOR(
@@ -21,11 +21,11 @@ inline void check_single_tensor(const at::Tensor& tensor) {
 
     auto dtype = tensor.scalar_type();
     DISTRO_CHECK_TENSOR(
-        dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16 || 
-        dtype == at::kLong || dtype == at::kInt || dtype == at::kBool || 
-        dtype == at::kByte || dtype == at::kDouble,
-        "MCCL supports float32/float16/bfloat16 (training), int64/int32/bool/uint8 (metadata), and float64, got: " +
-        std::string(at::toString(dtype))
+        dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16 ||
+        dtype == at::kDouble ||
+        dtype == at::kLong || dtype == at::kInt || dtype == at::kShort ||
+        dtype == at::kChar || dtype == at::kByte || dtype == at::kBool,
+        "MCCL: unsupported dtype " + std::string(at::toString(dtype))
     );
 
     DISTRO_CHECK_TENSOR(
@@ -57,4 +57,4 @@ inline size_t tensor_nbytes(const at::Tensor& tensor) {
     return static_cast<size_t>(tensor.numel()) * tensor.element_size();
 }
 
-} // namespace distro
+} // namespace mccl

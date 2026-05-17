@@ -7,7 +7,7 @@
 #include <mutex>
 #include <vector>
 
-namespace distro {
+namespace mccl {
 
 class PeerMesh {
 public:
@@ -30,4 +30,4 @@ private:
     std::vector<std::unique_ptr<std::mutex>> send_mu_, recv_mu_;
 };
 
-} // namespace distro
+} // namespace mccl

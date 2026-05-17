@@ -20,7 +20,7 @@ def apply_thunderbolt_production_defaults(
     If ``training_defaults`` is True, also sets (when unset) ``DISTRO_OVERLAP_COMM=1``
     and ``DDP_BUCKET_MB=512`` for PyTorch DDP workloads.
 
-    Call **before** ``dist.init_process_group(backend="distro", ...)`` on every node.
+    Call **before** ``dist.init_process_group(backend="mccl", ...)`` on every node.
     """
     os.environ.setdefault("DISTRO_LINK_PROFILE", "thunderbolt")
     if training_defaults:

@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <functional>
 
-namespace distro {
+namespace mccl {
 
 /// Release-consistency coherence protocol with directory at the head node.
 ///
@@ -156,4 +156,4 @@ private:
     std::atomic<uint32_t> barrier_count_{0};
 };
 
-} // namespace distro
+} // namespace mccl

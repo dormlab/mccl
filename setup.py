@@ -229,7 +229,7 @@ class MCCLBuildExt(build_ext):
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             msg = (
                 "Metal shader compiler not found. Skipping precompiled "
-                "distro_shaders.metallib; shaders.metal installed for runtime JIT."
+                "mccl_shaders.metallib; shaders.metal installed for runtime JIT."
             )
             if require_metallib:
                 raise RuntimeError(
@@ -238,8 +238,8 @@ class MCCLBuildExt(build_ext):
             self.warn(msg)
             return
 
-        air_path = os.path.join(self.build_temp, "distro_shaders.air")
-        lib_path = os.path.join(output_dir, "distro_shaders.metallib")
+        air_path = os.path.join(self.build_temp, "mccl_shaders.air")
+        lib_path = os.path.join(output_dir, "mccl_shaders.metallib")
         os.makedirs(os.path.dirname(air_path), exist_ok=True)
 
         sdk_path = subprocess.check_output(
@@ -271,7 +271,7 @@ class MCCLBuildExt(build_ext):
         for d in self._shader_bundle_dest_dirs(ext, output_dir):
             if os.path.normpath(d) == os.path.normpath(output_dir):
                 continue
-            dup = os.path.join(d, "distro_shaders.metallib")
+            dup = os.path.join(d, "mccl_shaders.metallib")
             shutil.copy2(lib_path, dup)
             self.announce(f"Synced metallib to {dup}", level=2)
 
@@ -280,32 +280,38 @@ CPP_SOURCES = [
     "csrc/runtime/Rendezvous.cpp",
     "csrc/backend/WorkMCCL.cpp",
     "csrc/backend/PeerMesh.cpp",
+    "csrc/backend/Progress.cpp",
+    "csrc/backend/AllreduceAlgos.cpp",
     "csrc/backend/ProcessGroupMCCL.cpp",
     "csrc/backend/MPSFallback.cpp",
     "csrc/backend/Registration.cpp",
     "csrc/python/bindings.cpp",
 ]
 
-MM_SOURCES = []
+MM_SOURCES = [
+    "csrc/metal/MPSInterop.mm",
+    "csrc/metal/MetalKernels.mm",
+    "csrc/metal/EventSync.mm",
+]
 
 ext = Extension(
-    name="distro._C",
+    name="mccl._C",
     sources=CPP_SOURCES + MM_SOURCES,
     include_dirs=["csrc"],
     language="c++",
 )
 
 setup(
-    name="distro",
+    name="mccl",
     version="0.4.0",
     description="Distributed Metal GPU Runtime for Apple Silicon clusters",
-    packages=["distro", "distro.distributed"],
+    packages=["mccl", "mccl.distributed"],
     ext_modules=[ext],
     cmdclass={"build_ext": MCCLBuildExt},
     python_requires=">=3.11",
     entry_points={
         "console_scripts": [
-            "distro=distro.cli:main",
+            "mccl=mccl.cli:main",
         ],
     },
 )

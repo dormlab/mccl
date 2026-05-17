@@ -8,7 +8,7 @@
 
 #define DISTRO_VERSION_STRING "0.4.0"
 
-namespace distro {
+namespace mccl {
 
 struct Version {
     static constexpr int major   = DISTRO_VERSION_MAJOR;
@@ -17,4 +17,4 @@ struct Version {
     static constexpr int protocol = DISTRO_PROTOCOL_VERSION;
 };
 
-} // namespace distro
+} // namespace mccl

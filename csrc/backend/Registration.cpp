@@ -10,9 +10,9 @@
 
 namespace py = pybind11;
 
-namespace distro {
+namespace mccl {
 
-/// Called by `distro._C._register_mccl_backend(module)` so the pybind11
+/// Called by `mccl._C._register_mccl_backend(module)` so the pybind11
 /// module that owns the symbols is the same one Python imports.
 ///
 /// Exposes:
@@ -27,8 +27,9 @@ void register_mccl_backend(py::module_& m) {
               -> c10::intrusive_ptr<c10d::Backend> {
               ProcessGroupMCCL::Options opts;
               opts.timeout = timeout;
-              return c10::make_intrusive<ProcessGroupMCCL>(
+              auto pg = c10::make_intrusive<ProcessGroupMCCL>(
                   store, rank, size, opts);
+              return pg;
           },
           py::arg("store"),
           py::arg("rank"),
@@ -37,4 +38,4 @@ void register_mccl_backend(py::module_& m) {
           "Factory used by torch.distributed.Backend.register_backend('mccl').");
 }
 
-} // namespace distro
+} // namespace mccl

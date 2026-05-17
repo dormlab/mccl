@@ -5,7 +5,7 @@
 #include <numeric>
 #include <cmath>
 
-namespace distro {
+namespace mccl {
 
 Metrics::Metrics() = default;
 
@@ -151,4 +151,4 @@ std::vector<OpMetric> Metrics::recent_ops(size_t n) const {
     return std::vector<OpMetric>(completed_.end() - n, completed_.end());
 }
 
-} // namespace distro
+} // namespace mccl

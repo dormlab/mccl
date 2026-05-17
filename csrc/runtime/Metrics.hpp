@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace distro {
+namespace mccl {
 
 /// Per-collective timing record with per-phase breakdown.
 struct OpMetric {
@@ -110,4 +110,4 @@ private:
     std::atomic<uint64_t> total_errors_{0};
 };
 
-} // namespace distro
+} // namespace mccl

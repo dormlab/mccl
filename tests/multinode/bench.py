@@ -5,7 +5,7 @@ import time
 import torch
 import torch.distributed as dist
 
-import distro  # noqa: F401
+import mccl  # noqa: F401
 
 
 def run(rank: int, world_size: int, master: str, port: int, device: str):
