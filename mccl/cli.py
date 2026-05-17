@@ -121,6 +121,12 @@ def parse_memory(s: str) -> int:
     return int(s)  # Raw bytes
 
 
+def cmd_check(args) -> None:
+    """Verify TB + Tailscale + Python + extension are configured."""
+    from mccl.check import run_all
+    sys.exit(run_all())
+
+
 def cmd_test(args) -> None:
     """Run the mccl test suite via pytest."""
     if args.worlds:
@@ -146,10 +152,16 @@ def main():
     )
     parser.add_argument("--test", action="store_true",
                         help="Run the test suite (shortcut for `mccl test`).")
+    parser.add_argument("--check", action="store_true",
+                        help="Verify TB + Tailscale setup (shortcut for `mccl check`).")
     parser.add_argument("--worlds", default=None,
                         help="Comma-separated world sizes for --test "
                              "(e.g. --worlds 2,3,4,8).")
     sub = parser.add_subparsers(dest="command")
+
+    # check
+    sub.add_parser("check", help="Verify TB / Tailscale / extension setup"
+                  ).set_defaults(func=cmd_check)
 
     # test
     p = sub.add_parser("test", help="Run the test suite")
@@ -187,6 +199,9 @@ def main():
     sub.add_parser("watch", help="Watch scheduler queue").set_defaults(func=cmd_watch)
 
     args = parser.parse_args()
+    if args.check:
+        cmd_check(args)
+        return
     if args.test:
         # Shorthand: `mccl --test` → `mccl test`
         if not hasattr(args, "func"):

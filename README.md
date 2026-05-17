@@ -1,27 +1,42 @@
 # MCCL
 
-[![CI](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mps-ddp/mccl/actions/workflows/ci.yml)
+`mccl` registers an `mccl` backend for `torch.distributed` on Apple Silicon, designed for clusters of Mac minis connected by Thunderbolt.
 
-MCCL registers a **`mccl`** backend for **`torch.distributed`** on **Apple Silicon (MPS)**.
+## Hardware
 
-Install PyTorch, then **`pip install mccl`**. **To our knowledge**, the first **`torch.distributed` backend** with **MPS DDP** (including multi-node). Same **`torchrun`** workflow; **`MASTER_ADDR`** on every node — [docs/MULTINODE.md](docs/MULTINODE.md). **TCP** by default; **RDMA** where supported.
+- **Required: Thunderbolt cables between every pair of machines.** Data-plane bandwidth is ~3 GB/s per TB link vs ~100 MB/s over WiFi/LAN. The backend will fall through to non-TB paths if asked to, but training perf collapses by 30×.
+- **Recommended: Tailscale** on each machine. Used only as a control plane — rendezvous, barriers, SSH — and gives you a uniform `100.x.x.x` address per node regardless of LAN topology. Free, easy, takes ~2 min per node.
+- Apple Silicon (arm64). Python ≥ 3.11.
 
-## Requirements
+## Setup
 
-- Apple Silicon Mac (arm64). No Intel.
-- **Xcode Command Line Tools** — `xcode-select --install` (needed to compile the extension).
-- **Full Xcode** — **optional for local `pip install -e .`**: without `xcrun metal`, the build skips the precompiled `mccl_shaders.metallib` but still installs **`shaders.metal`** next to `_C` for **runtime JIT**. For **PyPI releases**, CI sets **`MCCL_REQUIRE_METALLIB=1`** so wheels always include the `.metallib` (needs Xcode on the builder).
-- **Python 3.11+**
-- **`torch` (PyTorch) ≥2.5** and **`numpy` ≥1.20** — declared in [`pyproject.toml`](pyproject.toml) / [`requirements.txt`](requirements.txt); install `torch` first when building from source so headers/libs resolve.
+On every machine:
 
-## Install
+1. **Tailscale** (recommended). Install from https://tailscale.com/download/macos, sign in, confirm with `tailscale status`.
+2. **Thunderbolt Bridge IPs**. Plug TB cables to your peers, then System Settings → Network → Thunderbolt Bridge (or each individual TB port) → Manually → assign a `/24` per pair, e.g. lexie↔derek on `192.168.102.0/24`, lexie↔amelia on `192.168.103.0/24`. Apply, repeat on each end.
+3. **Xcode CLI tools**: `xcode-select --install`.
+4. **Install mccl**:
+   ```bash
+   pip install torch>=2.5
+   pip install -e .          # from source
+   # or:  pip install mccl   # once published
+   ```
+5. **Verify**:
+   ```bash
+   mccl --check
+   ```
+   Exits 0 if platform / Python / Xcode CLI / extension / Thunderbolt IPs are all OK. Tailscale and peer reachability are advisory. Set `MCCL_PEERS=192.168.102.1,192.168.103.1` to also ping peer TB IPs.
+
+## Run
 
 ```bash
-pip install torch
-pip install mccl
-```
+# single-host smoke
+mccl --test                           # unit + integration via mp.spawn
 
-Source tree: `pip install -e ".[dev]"`. If the PyPI name `mccl` is taken, rename in `pyproject.toml` and `setup.py`.
+# multi-host bench (one command per machine)
+RANK=$N WORLD_SIZE=3 MASTER_ADDR=192.168.103.2 MASTER_PORT=29500 \
+  python tests/multinode/bench.py --rank $N --world 3 --master 192.168.103.2
+```
 
 Demo: https://github.com/user-attachments/assets/21865149-b077-4b65-93cc-f9e319ff0328
 
