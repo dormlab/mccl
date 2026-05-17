@@ -158,6 +158,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     if (getSize() == 1) {
         return make_completed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
     }
+    DISTRO_CHECK(!tensors.empty(), "broadcast: empty tensor list");
     auto tensors_copy = tensors;
     int root = opts.rootRank;
     PeerMesh* mesh = mesh_.get();
@@ -165,24 +166,31 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::BROADCAST, tensors,
         "mccl:broadcast", [mesh, rank, world, root, tensors_copy]() mutable {
+        if (rank == root) mps_event_sync();
         for (auto& t : tensors_copy) {
-            auto cpu = t.contiguous().cpu();
-            size_t nbytes = cpu.nbytes();
+            DISTRO_CHECK(t.is_contiguous(),
+                         "broadcast: tensor must be contiguous");
             if (rank == root) {
+                auto send_sb = stage_for_send_nosync(t);
+                size_t nbytes = send_sb.nbytes;
                 std::vector<std::thread> ts;
+                ts.reserve(world - 1);
                 for (int p = 0; p < world; ++p) {
                     if (p == root) continue;
-                    ts.emplace_back([mesh, p, &cpu, nbytes] {
-                        mesh->send(p, cpu.data_ptr(), nbytes);
+                    ts.emplace_back([mesh, p, send_sb, nbytes] {
+                        mesh->send(p, send_sb.data, nbytes);
                     });
                 }
                 for (auto& th : ts) th.join();
             } else {
-                mesh->recv(root, cpu.data_ptr(), nbytes);
-                t.copy_(cpu);
+                size_t nbytes = static_cast<size_t>(t.nbytes());
+                std::vector<uint8_t> buf(nbytes);
+                mesh->recv(root, buf.data(), nbytes);
+                unstage_from_recv(t, buf.data(), nbytes);
             }
         }
-    });
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
