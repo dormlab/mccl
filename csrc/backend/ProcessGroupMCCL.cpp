@@ -2,6 +2,8 @@
 #include "backend/WorkMCCL.hpp"
 #include "backend/PeerMesh.hpp"
 #include "backend/Progress.hpp"
+#include "metal/MPSInterop.hpp"
+#include "metal/MetalKernels.hpp"
 #include "runtime/Rendezvous.hpp"
 #include "common/Errors.hpp"
 
@@ -43,8 +45,10 @@ c10::intrusive_ptr<c10d::Work> async_submit_(
     c10d::OpType op,
     std::vector<at::Tensor> outputs,
     const char* title,
-    std::function<void()> body) {
+    std::function<void()> body,
+    std::function<void()> sync_cb = {}) {
     auto work = c10::make_intrusive<WorkMCCL>(op, std::move(outputs), title);
+    if (sync_cb) work->setSyncCallback(std::move(sync_cb));
     engine.submit([work, body = std::move(body)]() {
         try {
             body();
@@ -54,20 +58,6 @@ c10::intrusive_ptr<c10d::Work> async_submit_(
         }
     });
     return work;
-}
-
-std::vector<uint8_t> tensor_to_bytes(const at::Tensor& t) {
-    auto c = t.contiguous().cpu();
-    std::vector<uint8_t> b(c.nbytes());
-    std::memcpy(b.data(), c.data_ptr(), b.size());
-    return b;
-}
-
-at::Tensor bytes_to_cpu_like(const std::vector<uint8_t>& b, const at::Tensor& tmpl) {
-    auto t = at::empty(tmpl.sizes(), tmpl.options().device(at::kCPU));
-    DISTRO_CHECK(b.size() == static_cast<size_t>(t.nbytes()), "size mismatch");
-    std::memcpy(t.data_ptr(), b.data(), b.size());
-    return t;
 }
 
 void cpu_reduce_(at::Tensor& dst, const at::Tensor& src, c10d::ReduceOp::RedOpType op) {
@@ -93,6 +83,7 @@ ProcessGroupMCCL::ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
       store_(std::move(store)),
       opts_(opts) {
     DISTRO_CHECK(rank >= 0 && rank < size, "rank/size invalid");
+    metal_kernels_init();
     if (size > 1) {
         rendezvous_ = std::make_unique<Rendezvous>(
             store_, rank, size, opts_.timeout);
@@ -109,6 +100,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     if (getSize() == 1) {
         return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
     }
+    DISTRO_CHECK(!tensors.empty(), "allreduce: empty tensor list");
     auto op = opts.reduceOp;
     auto tensors_copy = tensors;
     PeerMesh* mesh = mesh_.get();
@@ -116,30 +108,49 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::ALLREDUCE, tensors,
         "mccl:allreduce", [mesh, rank, world, op, tensors_copy]() mutable {
+        // Make sure any pending MPS compute writing into the input tensors is
+        // committed to their MTLBuffers before we read their bytes.
+        mps_event_sync();
+
         for (auto& t : tensors_copy) {
-            auto src = t.contiguous().cpu();
-            auto acc = src.is_same(t) ? src : src.clone();
-            size_t nbytes = acc.nbytes();
-            std::vector<at::Tensor> recvbufs(world);
+            DISTRO_CHECK(t.is_contiguous(),
+                         "allreduce: input must be contiguous");
+
+            auto send_sb = stage_for_send_nosync(t);
+            size_t nbytes = send_sb.nbytes;
+
+            std::vector<at::Tensor> peer_tmp(world);
+            std::vector<std::vector<uint8_t>> recv_bufs(world);
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                peer_tmp[p] = at::empty_like(t);
+                recv_bufs[p].resize(nbytes);
+            }
+
             std::vector<std::thread> ts;
             ts.reserve(world - 1);
             for (int p = 0; p < world; ++p) {
                 if (p == rank) continue;
-                recvbufs[p] = at::empty_like(acc);
-                ts.emplace_back([mesh, p, &acc, nbytes, &recvbufs] {
-                    mesh->send(p, acc.data_ptr(), nbytes);
-                    mesh->recv(p, recvbufs[p].data_ptr(), nbytes);
+                ts.emplace_back([mesh, p, send_sb, nbytes, &recv_bufs] {
+                    mesh->send(p, send_sb.data, nbytes);
+                    mesh->recv(p, recv_bufs[p].data(), nbytes);
                 });
             }
             for (auto& th : ts) th.join();
+
+            metal_begin_batch("mccl:allreduce");
             for (int p = 0; p < world; ++p) {
                 if (p == rank) continue;
-                cpu_reduce_(acc, recvbufs[p], op);
+                unstage_from_recv(peer_tmp[p], recv_bufs[p].data(), nbytes);
+                metal_reduce_op(t, peer_tmp[p], op);
             }
-            if (op == c10d::ReduceOp::AVG) acc.div_(world);
-            if (!acc.is_same(t)) t.copy_(acc);
+            if (op == c10d::ReduceOp::AVG) {
+                metal_scale_inplace(t, 1.0 / static_cast<double>(world));
+            }
+            metal_end_batch();
         }
-    });
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(

@@ -287,7 +287,11 @@ CPP_SOURCES = [
     "csrc/python/bindings.cpp",
 ]
 
-MM_SOURCES = []
+MM_SOURCES = [
+    "csrc/metal/MPSInterop.mm",
+    "csrc/metal/MetalKernels.mm",
+    "csrc/metal/EventSync.mm",
+]
 
 ext = Extension(
     name="mccl._C",
