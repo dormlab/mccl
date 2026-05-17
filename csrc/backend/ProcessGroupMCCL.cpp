@@ -525,26 +525,38 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::ALLTOALL, output_tensors,
         "mccl:alltoall", [mesh, rank, world, outs_copy, ins_copy]() mutable {
-        std::vector<at::Tensor> in_cpu(world), out_cpu(world);
+        mps_event_sync();
+        std::vector<StagingBuffer> send_sbs(world);
+        std::vector<std::vector<uint8_t>> recv_bufs(world);
         for (int p = 0; p < world; ++p) {
-            in_cpu[p]  = ins_copy[p].contiguous().cpu();
-            out_cpu[p] = at::empty(outs_copy[p].sizes(),
-                                   outs_copy[p].options().device(at::kCPU));
+            DISTRO_CHECK(ins_copy[p].is_contiguous() && outs_copy[p].is_contiguous(),
+                         "alltoall: inputs/outputs must be contiguous");
+            send_sbs[p] = stage_for_send_nosync(ins_copy[p]);
+            if (p == rank) continue;
+            recv_bufs[p].resize(static_cast<size_t>(outs_copy[p].nbytes()));
         }
-        out_cpu[rank].copy_(in_cpu[rank]);
+
+        unstage_from_recv(outs_copy[rank], send_sbs[rank].data,
+                          send_sbs[rank].nbytes);
 
         std::vector<std::thread> ts;
         ts.reserve(world - 1);
         for (int p = 0; p < world; ++p) {
             if (p == rank) continue;
-            ts.emplace_back([mesh, p, &in_cpu, &out_cpu] {
-                mesh->send(p, in_cpu[p].data_ptr(), in_cpu[p].nbytes());
-                mesh->recv(p, out_cpu[p].data_ptr(), out_cpu[p].nbytes());
+            ts.emplace_back([mesh, p, sb = send_sbs[p], &recv_bufs] {
+                mesh->send(p, sb.data, sb.nbytes);
+                mesh->recv(p, recv_bufs[p].data(), recv_bufs[p].size());
             });
         }
         for (auto& th : ts) th.join();
-        for (int p = 0; p < world; ++p) outs_copy[p].copy_(out_cpu[p]);
-    });
+
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            unstage_from_recv(outs_copy[p], recv_bufs[p].data(),
+                              recv_bufs[p].size());
+        }
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
