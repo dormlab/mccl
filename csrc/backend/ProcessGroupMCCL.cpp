@@ -257,36 +257,41 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         "mccl:allgather", [mesh, rank, world, outs_copy, ins_copy]() mutable {
         DISTRO_CHECK(ins_copy.size() == outs_copy.size(),
                      "allgather: input/output count mismatch");
+        mps_event_sync();
         for (size_t i = 0; i < ins_copy.size(); ++i) {
             auto& in = ins_copy[i];
             auto& outs = outs_copy[i];
             DISTRO_CHECK(static_cast<int>(outs.size()) == world,
                          "allgather: output list size != world");
-            auto in_cpu = in.contiguous().cpu();
-            size_t chunk = in_cpu.nbytes();
-            std::vector<at::Tensor> peer_cpu(world);
+            DISTRO_CHECK(in.is_contiguous(),
+                         "allgather: input must be contiguous");
+
+            auto send_sb = stage_for_send_nosync(in);
+            size_t chunk = send_sb.nbytes;
+            std::vector<std::vector<uint8_t>> peer_buf(world);
             for (int p = 0; p < world; ++p) {
                 if (p == rank) continue;
-                peer_cpu[p] = at::empty(outs[p].sizes(),
-                                        outs[p].options().device(at::kCPU));
+                peer_buf[p].resize(chunk);
             }
             std::vector<std::thread> ts;
             ts.reserve(world - 1);
             for (int p = 0; p < world; ++p) {
                 if (p == rank) continue;
-                ts.emplace_back([mesh, p, &in_cpu, chunk, &peer_cpu] {
-                    mesh->send(p, in_cpu.data_ptr(), chunk);
-                    mesh->recv(p, peer_cpu[p].data_ptr(), chunk);
+                ts.emplace_back([mesh, p, send_sb, chunk, &peer_buf] {
+                    mesh->send(p, send_sb.data, chunk);
+                    mesh->recv(p, peer_buf[p].data(), chunk);
                 });
             }
             for (auto& th : ts) th.join();
-            outs[rank].copy_(in_cpu);
+
+            unstage_from_recv(outs[rank], send_sb.data, chunk);
             for (int p = 0; p < world; ++p) {
                 if (p == rank) continue;
-                outs[p].copy_(peer_cpu[p]);
+                unstage_from_recv(outs[p], peer_buf[p].data(), chunk);
             }
         }
-    });
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
