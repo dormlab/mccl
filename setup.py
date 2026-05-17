@@ -280,6 +280,7 @@ CPP_SOURCES = [
     "csrc/runtime/Rendezvous.cpp",
     "csrc/backend/WorkMCCL.cpp",
     "csrc/backend/PeerMesh.cpp",
+    "csrc/backend/Progress.cpp",
     "csrc/backend/ProcessGroupMCCL.cpp",
     "csrc/backend/MPSFallback.cpp",
     "csrc/backend/Registration.cpp",

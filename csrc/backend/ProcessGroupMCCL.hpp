@@ -16,6 +16,7 @@ namespace mccl {
 
 class Rendezvous;
 class PeerMesh;
+class Progress;
 
 /// MCCL c10d backend for Apple Silicon clusters.
 ///
@@ -105,6 +106,7 @@ private:
     Options opts_;
     std::unique_ptr<Rendezvous> rendezvous_;
     std::unique_ptr<PeerMesh> mesh_;
+    std::unique_ptr<Progress> engine_;
     std::atomic<uint64_t> seq_{0};
 
     uint64_t next_seq_() { return seq_.fetch_add(1, std::memory_order_relaxed); }
