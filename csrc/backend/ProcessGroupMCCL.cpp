@@ -305,43 +305,55 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
     auto op = opts.reduceOp;
     at::Tensor out_copy = output_tensor;
     at::Tensor in_copy = input_tensor;
+    DISTRO_CHECK(in_copy.is_contiguous() && out_copy.is_contiguous(),
+                 "_reduce_scatter_base: input/output must be contiguous");
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::_REDUCE_SCATTER_BASE,
         {output_tensor}, "mccl:_reduce_scatter_base",
         [mesh, rank, world, op, out_copy, in_copy]() mutable {
-        auto in_cpu = in_copy.contiguous().cpu();
-        size_t chunk = out_copy.nbytes();
-        DISTRO_CHECK(in_cpu.nbytes() == chunk * world,
+        mps_event_sync();
+        auto send_sb = stage_for_send_nosync(in_copy);
+        size_t chunk = static_cast<size_t>(out_copy.nbytes());
+        DISTRO_CHECK(send_sb.nbytes == chunk * world,
                      "_reduce_scatter_base: input size != output * world");
-        auto* src = static_cast<uint8_t*>(in_cpu.data_ptr());
-        auto acc = at::empty(out_copy.sizes(),
-                             out_copy.options().device(at::kCPU));
-        std::memcpy(acc.data_ptr(), src + rank * chunk, chunk);
-        std::vector<at::Tensor> recvbufs(world);
+
+        // Seed output with our own share; we then reduce peers' shares into it.
+        const auto* src = static_cast<const uint8_t*>(send_sb.data);
+        unstage_from_recv(out_copy, src + rank * chunk, chunk);
+
+        std::vector<at::Tensor> peer_tmp(world);
+        std::vector<std::vector<uint8_t>> recv_bufs(world);
         for (int p = 0; p < world; ++p) {
             if (p == rank) continue;
-            recvbufs[p] = at::empty(out_copy.sizes(),
-                                    out_copy.options().device(at::kCPU));
+            peer_tmp[p] = at::empty_like(out_copy);
+            recv_bufs[p].resize(chunk);
         }
+
         std::vector<std::thread> ts;
         ts.reserve(world - 1);
         for (int p = 0; p < world; ++p) {
             if (p == rank) continue;
-            ts.emplace_back([mesh, p, src, chunk, &recvbufs] {
+            ts.emplace_back([mesh, p, src, chunk, &recv_bufs] {
                 mesh->send(p, src + p * chunk, chunk);
-                mesh->recv(p, recvbufs[p].data_ptr(), chunk);
+                mesh->recv(p, recv_bufs[p].data(), chunk);
             });
         }
         for (auto& th : ts) th.join();
+
+        metal_begin_batch("mccl:_reduce_scatter_base");
         for (int p = 0; p < world; ++p) {
             if (p == rank) continue;
-            cpu_reduce_(acc, recvbufs[p], op);
+            unstage_from_recv(peer_tmp[p], recv_bufs[p].data(), chunk);
+            metal_reduce_op(out_copy, peer_tmp[p], op);
         }
-        if (op == c10d::ReduceOp::AVG) acc.div_(world);
-        out_copy.copy_(acc);
-    });
+        if (op == c10d::ReduceOp::AVG) {
+            metal_scale_inplace(out_copy, 1.0 / static_cast<double>(world));
+        }
+        metal_end_batch();
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
