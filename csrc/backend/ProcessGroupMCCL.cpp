@@ -5,6 +5,7 @@
 #include "backend/AllreduceAlgos.hpp"
 #include "metal/MPSInterop.hpp"
 #include "metal/MetalKernels.hpp"
+#include "metal/EventSync.hpp"
 #include "runtime/Rendezvous.hpp"
 #include "common/Errors.hpp"
 
@@ -48,10 +49,17 @@ c10::intrusive_ptr<c10d::Work> async_submit_(
     const char* title,
     std::function<void()> body,
     std::function<void()> sync_cb = {}) {
+    // commit_mps_and_signal touches torch's MPS dispatch queue via
+    // dispatch_sync; call it on the issuing thread before handing the
+    // body off, then wait for the signal on the engine thread. Doing
+    // both inside the engine task can deadlock because the engine
+    // thread doesn't own torch's per-thread Metal command-buffer state.
+    uint64_t sync_val = mps_event_sync_nonblocking();
     auto work = c10::make_intrusive<WorkMCCL>(op, std::move(outputs), title);
     if (sync_cb) work->setSyncCallback(std::move(sync_cb));
-    engine.submit([work, body = std::move(body)]() {
+    engine.submit([work, body = std::move(body), sync_val]() {
         try {
+            if (sync_val > 0) wait_for_mps(sync_val);
             body();
             work->finish();
         } catch (...) {
@@ -101,36 +109,50 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     }
     DISTRO_CHECK(!tensors.empty(), "allreduce: empty tensor list");
     auto op = opts.reduceOp;
-    auto tensors_copy = tensors;
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
+    std::vector<AllreduceArgs> argv;
+    std::vector<std::string> algv;
+    argv.reserve(tensors.size());
+    algv.reserve(tensors.size());
+    for (auto& t : tensors) {
+        check_mps_(t, "allreduce");
+        size_t bytes = static_cast<size_t>(t.nbytes());
+
+        const char* env_alg = std::getenv("MCCL_ALLREDUCE_ALGO");
+        std::string alg = env_alg ? env_alg : "auto";
+        if (alg == "auto") {
+            size_t tree_below = 256ull * 1024;
+            if (const char* e = std::getenv("MCCL_TREE_BELOW"))
+                tree_below = std::strtoull(e, nullptr, 10);
+            alg = (bytes <= tree_below) ? "tree" : "ring";
+        }
+        if (alg == "ring" && t.numel() < world) alg = "tree";
+
+        AllreduceArgs a;
+        a.t_view  = extract_mps_buffer(t);
+        a.dtype   = t.scalar_type();
+        a.numel   = static_cast<uint32_t>(t.numel());
+
+        if (alg == "ring") {
+            int64_t per = (t.numel() + world - 1) / world;
+            a.recv_scratch = at::empty({per}, t.options());
+        } else {
+            a.recv_scratch = at::empty_like(t);
+        }
+        a.recv_view = extract_mps_buffer(a.recv_scratch);
+
+        argv.push_back(std::move(a));
+        algv.push_back(std::move(alg));
+    }
+
     return async_submit_(*engine_, c10d::OpType::ALLREDUCE, tensors,
-        "mccl:allreduce", [mesh, rank, world, op, tensors_copy]() mutable {
-        for (auto& t : tensors_copy) {
-            check_mps_(t, "allreduce");
-            size_t bytes = static_cast<size_t>(t.nbytes());
-
-            // Algorithm selection.
-            //   MCCL_ALLREDUCE_ALGO = ring | tree | auto (default)
-            //   MCCL_TREE_BELOW     = bytes; auto picks tree if bytes <= TREE_BELOW
-            const char* env_alg = std::getenv("MCCL_ALLREDUCE_ALGO");
-            std::string alg = env_alg ? env_alg : "auto";
-            if (alg == "auto") {
-                size_t tree_below = 256ull * 1024;
-                if (const char* e = std::getenv("MCCL_TREE_BELOW")) {
-                    tree_below = std::strtoull(e, nullptr, 10);
-                }
-                alg = (bytes <= tree_below) ? "tree" : "ring";
-            }
-            // Ring needs at least one element per chunk.
-            if (alg == "ring" && t.numel() < world) alg = "tree";
-
-            if (alg == "ring") {
-                allreduce_ring(t, op, rank, world, mesh);
-            } else {
-                allreduce_tree(t, op, rank, world, mesh);
-            }
+        "mccl:allreduce",
+        [mesh, rank, world, op, argv = std::move(argv), algv = std::move(algv)]() mutable {
+        for (size_t i = 0; i < argv.size(); ++i) {
+            if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
+            else                    allreduce_tree(argv[i], op, rank, world, mesh);
         }
     },
     /*sync_cb=*/[]() { metal_sync(); });
@@ -149,7 +171,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::BROADCAST, tensors,
         "mccl:broadcast", [mesh, rank, world, root, tensors_copy]() mutable {
-        if (rank == root) mps_event_sync();
+        
         for (auto& t : tensors_copy) {
             check_mps_(t, "broadcast");
             if (rank == root) {
@@ -193,7 +215,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
         [mesh, rank, world, out_copy, in_copy]() mutable {
         check_mps_(in_copy, "_allgather_base");
         check_mps_(out_copy, "_allgather_base");
-        mps_event_sync();
         auto send_sb = stage_for_send_nosync(in_copy);
         size_t chunk = send_sb.nbytes;
         size_t total = static_cast<size_t>(out_copy.nbytes());
@@ -239,7 +260,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         "mccl:allgather", [mesh, rank, world, outs_copy, ins_copy]() mutable {
         DISTRO_CHECK(ins_copy.size() == outs_copy.size(),
                      "allgather: input/output count mismatch");
-        mps_event_sync();
         for (size_t i = 0; i < ins_copy.size(); ++i) {
             auto& in = ins_copy[i];
             auto& outs = outs_copy[i];
@@ -295,7 +315,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
         [mesh, rank, world, op, out_copy, in_copy]() mutable {
         check_mps_(in_copy, "_reduce_scatter_base");
         check_mps_(out_copy, "_reduce_scatter_base");
-        mps_event_sync();
         auto send_sb = stage_for_send_nosync(in_copy);
         size_t chunk = static_cast<size_t>(out_copy.nbytes());
         DISTRO_CHECK(send_sb.nbytes == chunk * world,
@@ -360,7 +379,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
         [mesh, rank, world, op, outs_copy, ins_copy]() mutable {
         DISTRO_CHECK(outs_copy.size() == ins_copy.size(),
                      "reduce_scatter: count mismatch");
-        mps_event_sync();
         for (size_t i = 0; i < outs_copy.size(); ++i) {
             auto& out = outs_copy[i];
             auto& ins = ins_copy[i];
@@ -440,7 +458,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
         check_mps_(input_tensor, "alltoall_base");
         check_mps_(output_tensor, "alltoall_base");
 
-        mps_event_sync();
         auto send_sb = stage_for_send_nosync(input_tensor);
         size_t esize = static_cast<size_t>(input_tensor.element_size());
         DISTRO_CHECK(esize == static_cast<size_t>(output_tensor.element_size()),
@@ -518,7 +535,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::ALLTOALL, output_tensors,
         "mccl:alltoall", [mesh, rank, world, outs_copy, ins_copy]() mutable {
-        mps_event_sync();
         std::vector<StagingBuffer> send_sbs(world);
         std::vector<std::vector<uint8_t>> recv_bufs(world);
         for (int p = 0; p < world; ++p) {
@@ -571,7 +587,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     PeerMesh* mesh = mesh_.get();
     return async_submit_(*engine_, c10d::OpType::SEND, tensors, "mccl:send",
         [mesh, dst_rank, tag, tensors_copy]() mutable {
-        mps_event_sync();
         for (auto& t : tensors_copy) {
             check_mps_(t, "send");
             auto sb = stage_for_send_nosync(t);

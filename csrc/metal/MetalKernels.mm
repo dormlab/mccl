@@ -575,4 +575,101 @@ void metal_end_batch() {
     }
 }
 
+namespace {
+
+void dispatch_binary_view(id<MTLComputePipelineState> pso,
+                          const MPSBufferView& dst_view,
+                          const MPSBufferView& src_view,
+                          at::ScalarType dtype, uint32_t count,
+                          const char* label) {
+    KernelCache& c = cache();
+    id<MTLBuffer> dst_buf = (__bridge id<MTLBuffer>)dst_view.mtl_buffer;
+    id<MTLBuffer> src_buf = (__bridge id<MTLBuffer>)src_view.mtl_buffer;
+    auto dp = compute_dispatch(pso, count);
+    bool aligned = binary_vector_aligned(dst_view, src_view, dtype);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, label);
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:dst_buf offset:dst_view.byte_offset atIndex:0];
+        [enc setBuffer:src_buf offset:src_view.byte_offset atIndex:1];
+        [enc setBytes:&count length:sizeof(count) atIndex:2];
+        [enc setBytes:&aligned length:sizeof(aligned) atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(dp.grid_width, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(dp.threadgroup_width, 1, 1)];
+        [enc endEncoding];
+        finish_command_buffer(c, cmd);
+    }
+}
+
+id<MTLComputePipelineState> select_op_pipeline(
+    KernelCache& c, at::ScalarType dtype, c10d::ReduceOp::RedOpType op) {
+    switch (op) {
+        case c10d::ReduceOp::SUM:
+        case c10d::ReduceOp::AVG:
+            return select_accumulate_pipeline(c, dtype);
+        case c10d::ReduceOp::MIN:
+            return dtype == at::kFloat ? c.min_f32 :
+                   dtype == at::kHalf  ? c.min_f16 : c.min_bf16;
+        case c10d::ReduceOp::MAX:
+            return dtype == at::kFloat ? c.max_f32 :
+                   dtype == at::kHalf  ? c.max_f16 : c.max_bf16;
+        case c10d::ReduceOp::PRODUCT:
+            return dtype == at::kFloat ? c.product_f32 :
+                   dtype == at::kHalf  ? c.product_f16 : c.product_bf16;
+        default:
+            return nil;
+    }
+}
+
+} // anonymous namespace
+
+void metal_reduce_op_view(const MPSBufferView& dst, const MPSBufferView& src,
+                          at::ScalarType dtype, uint32_t count,
+                          c10d::ReduceOp::RedOpType op) {
+    KernelCache& c = cache();
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
+    auto pso = select_op_pipeline(c, dtype, op);
+    DISTRO_CHECK(pso != nil,
+                 "No Metal pipeline for dtype " + std::string(at::toString(dtype)));
+    dispatch_binary_view(pso, dst, src, dtype, count, "mccl_reduce_view");
+    // The next algorithm step reads `dst` over the wire — must block until
+    // the kernel has committed its writes to the MTLBuffer.
+    mccl_queue_drain();
+}
+
+void metal_scale_inplace_view(const MPSBufferView& buf, at::ScalarType dtype,
+                              uint32_t count, double scale) {
+    KernelCache& c = cache();
+    DISTRO_CHECK(c.initialized, "metal_kernels_init() not called");
+    auto pso = select_scale_pipeline(c, dtype);
+    DISTRO_CHECK(pso != nil,
+                 "No Metal scale pipeline for dtype " + std::string(at::toString(dtype)));
+    id<MTLBuffer> mtl_buf = (__bridge id<MTLBuffer>)buf.mtl_buffer;
+    auto dp = compute_dispatch(pso, count);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = acquire_command_buffer(c, "mccl_scale_view");
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:mtl_buf offset:buf.byte_offset atIndex:0];
+        if (dtype == at::kHalf) {
+            __fp16 h = (__fp16)scale;
+            [enc setBytes:&h length:sizeof(h) atIndex:1];
+        } else if (dtype == at::kBFloat16) {
+            uint32_t bits = ((uint32_t)__builtin_bit_cast(uint32_t, (float)scale)) >> 16;
+            uint16_t bf = (uint16_t)bits;
+            [enc setBytes:&bf length:sizeof(bf) atIndex:1];
+        } else {
+            float f = (float)scale;
+            [enc setBytes:&f length:sizeof(f) atIndex:1];
+        }
+        [enc setBytes:&count length:sizeof(count) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(dp.grid_width, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(dp.threadgroup_width, 1, 1)];
+        [enc endEncoding];
+        finish_command_buffer(c, cmd);
+    }
+    mccl_queue_drain();
+}
+
 } // namespace mccl

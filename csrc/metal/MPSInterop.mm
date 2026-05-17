@@ -316,6 +316,17 @@ void mccl_queue_drain() {
     }
 }
 
+void on_mps_thread(std::function<void()> fn) {
+    auto* dq = (dispatch_queue_t)torch::mps::get_dispatch_queue();
+    if (dq == nullptr) { fn(); return; }
+    __block std::exception_ptr eptr;
+    auto block = ^{
+        try { fn(); } catch (...) { eptr = std::current_exception(); }
+    };
+    dispatch_sync(dq, block);
+    if (eptr) std::rethrow_exception(eptr);
+}
+
 void mps_sync() {
     mps_stream_sync();
     mccl_queue_drain();

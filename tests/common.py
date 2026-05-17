@@ -64,22 +64,32 @@ def _free_port() -> int:
     return p
 
 
-def _entry(rank, world, port, fn, kwargs, results):
+def _entry(rank, world, port, fn, kwargs, result_path):
+    import pickle
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
+    payload = ("__EXC__", "worker did not complete")
     try:
         import mccl  # noqa: F401
         dist.init_process_group(
             backend="mccl", rank=rank, world_size=world,
             device_id=torch.device("mps:0"),
         )
-        results[rank] = fn(rank, world, **kwargs)
+        payload = ("OK", fn(rank, world, **kwargs))
     except Exception as e:
-        results[rank] = ("__EXC__",
-                         f"{type(e).__name__}: {e}\n{traceback.format_exc()[:500]}")
+        payload = ("__EXC__",
+                   f"{type(e).__name__}: {e}\n{traceback.format_exc()[:500]}")
     finally:
+        try:
+            with open(f"{result_path}/{rank}.pkl", "wb") as f:
+                pickle.dump(payload, f)
+        except Exception:
+            pass
         try: dist.destroy_process_group()
         except Exception: pass
+        # Force process exit to avoid hangs during interpreter teardown of
+        # MPS/Progress state in subprocesses.
+        os._exit(0)
 
 
 def spawn(fn, *, world: int = None, timeout: float = 60.0, **kwargs):
@@ -87,22 +97,38 @@ def spawn(fn, *, world: int = None, timeout: float = 60.0, **kwargs):
 
     Returns {rank: result}. Any worker exception is a pytest failure.
     """
+    import pickle, tempfile, shutil
     world = world or WORLD
     port = _free_port()
-    mgr = mp.Manager()
-    results = mgr.dict()
-    ctx = mp.spawn(_entry, args=(world, port, fn, kwargs, results),
-                   nprocs=world, join=False)
-    if not ctx.join(timeout=timeout):
-        for p in ctx.processes:
-            if p.is_alive(): p.terminate()
-        pytest.fail(f"spawn(world={world}) timed out after {timeout}s")
-    out = dict(results)
-    for r in range(world):
-        v = out.get(r)
-        if isinstance(v, tuple) and v and v[0] == "__EXC__":
-            pytest.fail(f"rank {r}: {v[1]}")
-    return out
+    result_dir = tempfile.mkdtemp(prefix="mccl_spawn_")
+    try:
+        ctx = mp.spawn(_entry, args=(world, port, fn, kwargs, result_dir),
+                       nprocs=world, join=False)
+        ok = False
+        deadline = __import__("time").monotonic() + timeout
+        while not ok and __import__("time").monotonic() < deadline:
+            try:
+                ok = ctx.join(timeout=1)
+            except Exception as e:
+                pytest.fail(f"spawn(world={world}) worker died: {e}")
+        if not ok:
+            for p in ctx.processes:
+                if p.is_alive(): p.terminate()
+            pytest.fail(f"spawn(world={world}) timed out after {timeout}s")
+        out = {}
+        for r in range(world):
+            try:
+                with open(f"{result_dir}/{r}.pkl", "rb") as f:
+                    out[r] = pickle.load(f)
+            except Exception as e:
+                pytest.fail(f"rank {r}: result file missing ({e})")
+        for r in range(world):
+            tag, val = out[r]
+            if tag == "__EXC__":
+                pytest.fail(f"rank {r}: {val}")
+        return {r: out[r][1] for r in range(world)}
+    finally:
+        shutil.rmtree(result_dir, ignore_errors=True)
 
 
 # ── Deterministic input generation ────────────────────────────────────

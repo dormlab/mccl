@@ -5,15 +5,20 @@ namespace mccl {
 
 namespace {
 
-// Re-resolve dispatch with the CPU key added to the keyset. The dispatcher
-// then picks c10d's CPU-key generic boxed shim — which pulls the
-// ProcessGroup off the op stack and calls the matching PG virtual — but
-// the tensors in the stack stay on MPS. The PG body handles them through
-// Metal kernels (see ProcessGroupMCCL.cpp); no host bounce.
+// Re-resolve the c10d op on the CPU dispatch key. c10d ships a generic
+// CPU-key boxed shim for every collective that pulls the ProcessGroup
+// off the op stack and calls the matching PG virtual. By redispatching
+// onto CPU we land in that shim with the tensors still on MPS — the PG
+// body (see ProcessGroupMCCL.cpp) handles them through Metal kernels
+// and zero-copy MTLBuffer staging.
+//
+// The keyset passed must contain ONLY CPU. Anything else (including any
+// MPS-flavoured key already in the original `ks`) makes the dispatcher
+// pick our own MPS impl again, infinite-looping.
 void mps_native_redispatch_boxed(const c10::OperatorHandle& op,
-                                 c10::DispatchKeySet ks,
+                                 c10::DispatchKeySet,
                                  torch::jit::Stack* stack) {
-    op.redispatchBoxed(ks | c10::DispatchKeySet(c10::DispatchKey::CPU), stack);
+    op.redispatchBoxed(c10::DispatchKeySet(c10::DispatchKey::CPU), stack);
 }
 
 } // namespace

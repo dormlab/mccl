@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "metal/MPSInterop.hpp"
+
 namespace mccl {
 
 void metal_kernels_init();
@@ -39,5 +41,16 @@ void metal_accumulate_and_scale(const at::Tensor& dst, const at::Tensor& src,
 
 /// Block until all MCCL Metal commands have completed.
 void metal_sync();
+
+/// View-based variants that take a pre-extracted MTLBuffer + offset + count
+/// and a dtype. Use these from threads where touching torch's MPS allocator
+/// state (`at::mps::getMTLBufferStorage`) would deadlock — e.g. the Progress
+/// engine thread. Callers extract `MPSBufferView`s via `extract_mps_buffer`
+/// once on the issuing thread and pass the views into the engine task.
+void metal_reduce_op_view(const MPSBufferView& dst, const MPSBufferView& src,
+                          at::ScalarType dtype, uint32_t count,
+                          c10d::ReduceOp::RedOpType op);
+void metal_scale_inplace_view(const MPSBufferView& buf, at::ScalarType dtype,
+                              uint32_t count, double scale);
 
 } // namespace mccl

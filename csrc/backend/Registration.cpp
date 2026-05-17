@@ -27,8 +27,9 @@ void register_mccl_backend(py::module_& m) {
               -> c10::intrusive_ptr<c10d::Backend> {
               ProcessGroupMCCL::Options opts;
               opts.timeout = timeout;
-              return c10::make_intrusive<ProcessGroupMCCL>(
+              auto pg = c10::make_intrusive<ProcessGroupMCCL>(
                   store, rank, size, opts);
+              return pg;
           },
           py::arg("store"),
           py::arg("rank"),

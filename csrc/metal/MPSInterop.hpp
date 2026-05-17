@@ -3,6 +3,7 @@
 #include <torch/torch.h>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace mccl {
 
@@ -75,5 +76,12 @@ void* get_mtl_device();
 
 /// Get or create a dedicated MTLCommandQueue for MCCL operations.
 void* get_mccl_command_queue();
+
+/// Run a callable on torch's MPS dispatch queue synchronously (blocks
+/// caller). Use to invoke Metal kernels from threads that don't own
+/// torch's per-thread Metal command-buffer state — direct Metal kernel
+/// dispatch from such threads hangs in the encoder. Exceptions are
+/// rethrown on the caller.
+void on_mps_thread(std::function<void()> fn);
 
 } // namespace mccl
