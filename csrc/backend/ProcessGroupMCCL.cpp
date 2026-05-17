@@ -437,6 +437,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
+    DISTRO_CHECK(in_copy.is_contiguous() && out_copy.is_contiguous(),
+                 "alltoall_base: input/output must be contiguous");
     return async_submit_(*engine_, c10d::OpType::ALLTOALL_BASE,
         {output_tensor}, "mccl:alltoall_base",
         [mesh, rank, world, out_copy, in_copy, out_splits_copy, in_splits_copy]() mutable {
@@ -444,17 +446,18 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
         auto& input_tensor = in_copy;
         auto& output_split_sizes = out_splits_copy;
         auto& input_split_sizes = in_splits_copy;
-        auto in_cpu = input_tensor.contiguous().cpu();
-        auto out_cpu = at::empty(output_tensor.sizes(),
-                                 output_tensor.options().device(at::kCPU));
-        size_t esize = static_cast<size_t>(in_cpu.element_size());
-        DISTRO_CHECK(esize == static_cast<size_t>(out_cpu.element_size()),
+
+        mps_event_sync();
+        auto send_sb = stage_for_send_nosync(input_tensor);
+        size_t esize = static_cast<size_t>(input_tensor.element_size());
+        DISTRO_CHECK(esize == static_cast<size_t>(output_tensor.element_size()),
                      "alltoall_base: dtype mismatch");
+        size_t out_bytes = static_cast<size_t>(output_tensor.nbytes());
 
         std::vector<size_t> in_off(world + 1, 0), out_off(world + 1, 0);
         if (input_split_sizes.empty()) {
-            size_t per = in_cpu.numel() / world * esize;
-            DISTRO_CHECK(per * world == in_cpu.nbytes(),
+            size_t per = static_cast<size_t>(input_tensor.numel()) / world * esize;
+            DISTRO_CHECK(per * world == send_sb.nbytes,
                          "alltoall_base: input not divisible by world");
             for (int p = 0; p < world; ++p) in_off[p + 1] = in_off[p] + per;
         } else {
@@ -464,8 +467,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
                 in_off[p + 1] = in_off[p] + input_split_sizes[p] * esize;
         }
         if (output_split_sizes.empty()) {
-            size_t per = out_cpu.numel() / world * esize;
-            DISTRO_CHECK(per * world == out_cpu.nbytes(),
+            size_t per = static_cast<size_t>(output_tensor.numel()) / world * esize;
+            DISTRO_CHECK(per * world == out_bytes,
                          "alltoall_base: output not divisible by world");
             for (int p = 0; p < world; ++p) out_off[p + 1] = out_off[p] + per;
         } else {
@@ -475,8 +478,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
                 out_off[p + 1] = out_off[p] + output_split_sizes[p] * esize;
         }
 
-        auto* src = static_cast<uint8_t*>(in_cpu.data_ptr());
-        auto* dst = static_cast<uint8_t*>(out_cpu.data_ptr());
+        const auto* src = static_cast<const uint8_t*>(send_sb.data);
+        std::vector<uint8_t> dst_buf(out_bytes);
+        auto* dst = dst_buf.data();
 
         size_t self_in_len  = in_off[rank + 1]  - in_off[rank];
         size_t self_out_len = out_off[rank + 1] - out_off[rank];
@@ -497,8 +501,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
             });
         }
         for (auto& th : ts) th.join();
-        output_tensor.copy_(out_cpu);
-    });
+        unstage_from_recv(output_tensor, dst_buf.data(), out_bytes);
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
