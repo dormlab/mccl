@@ -578,12 +578,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     PeerMesh* mesh = mesh_.get();
     return async_submit_(*engine_, c10d::OpType::SEND, tensors, "mccl:send",
         [mesh, dst_rank, tag, tensors_copy]() mutable {
+        mps_event_sync();
         for (auto& t : tensors_copy) {
-            auto cpu = t.contiguous().cpu();
-            uint32_t nbytes = static_cast<uint32_t>(cpu.nbytes());
+            DISTRO_CHECK(t.is_contiguous(), "send: tensor must be contiguous");
+            auto sb = stage_for_send_nosync(t);
+            uint32_t nbytes = static_cast<uint32_t>(sb.nbytes);
             int32_t hdr[2] = {tag, static_cast<int32_t>(nbytes)};
             mesh->send(dst_rank, hdr, sizeof(hdr));
-            mesh->send(dst_rank, cpu.data_ptr(), nbytes);
+            mesh->send(dst_rank, sb.data, nbytes);
         }
     });
 }
@@ -606,11 +608,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
             DISTRO_CHECK(nbytes == t.nbytes(),
                          "recv: size mismatch (expected " + std::to_string(t.nbytes())
                          + " got " + std::to_string(nbytes) + ")");
-            auto cpu = at::empty(t.sizes(), t.options().device(at::kCPU));
-            mesh->recv(src_rank, cpu.data_ptr(), nbytes);
-            t.copy_(cpu);
+            std::vector<uint8_t> buf(nbytes);
+            mesh->recv(src_rank, buf.data(), nbytes);
+            unstage_from_recv(t, buf.data(), nbytes);
         }
-    });
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Backend> ProcessGroupMCCL::create(
