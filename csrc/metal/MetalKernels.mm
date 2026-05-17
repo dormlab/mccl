@@ -10,7 +10,7 @@
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
-#include <c10d/Types.hpp>
+#include <torch/csrc/distributed/c10d/Types.hpp>
 
 namespace mccl {
 

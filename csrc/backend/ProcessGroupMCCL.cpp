@@ -2,6 +2,7 @@
 #include "backend/WorkMCCL.hpp"
 #include "backend/PeerMesh.hpp"
 #include "backend/Progress.hpp"
+#include "backend/AllreduceAlgos.hpp"
 #include "metal/MPSInterop.hpp"
 #include "metal/MetalKernels.hpp"
 #include "runtime/Rendezvous.hpp"
@@ -106,45 +107,30 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::ALLREDUCE, tensors,
         "mccl:allreduce", [mesh, rank, world, op, tensors_copy]() mutable {
-        // Make sure any pending MPS compute writing into the input tensors is
-        // committed to their MTLBuffers before we read their bytes.
-        mps_event_sync();
-
         for (auto& t : tensors_copy) {
             check_mps_(t, "allreduce");
+            size_t bytes = static_cast<size_t>(t.nbytes());
 
-            auto send_sb = stage_for_send_nosync(t);
-            size_t nbytes = send_sb.nbytes;
+            // Algorithm selection.
+            //   MCCL_ALLREDUCE_ALGO = ring | tree | auto (default)
+            //   MCCL_TREE_BELOW     = bytes; auto picks tree if bytes <= TREE_BELOW
+            const char* env_alg = std::getenv("MCCL_ALLREDUCE_ALGO");
+            std::string alg = env_alg ? env_alg : "auto";
+            if (alg == "auto") {
+                size_t tree_below = 256ull * 1024;
+                if (const char* e = std::getenv("MCCL_TREE_BELOW")) {
+                    tree_below = std::strtoull(e, nullptr, 10);
+                }
+                alg = (bytes <= tree_below) ? "tree" : "ring";
+            }
+            // Ring needs at least one element per chunk.
+            if (alg == "ring" && t.numel() < world) alg = "tree";
 
-            std::vector<at::Tensor> peer_tmp(world);
-            std::vector<std::vector<uint8_t>> recv_bufs(world);
-            for (int p = 0; p < world; ++p) {
-                if (p == rank) continue;
-                peer_tmp[p] = at::empty_like(t);
-                recv_bufs[p].resize(nbytes);
+            if (alg == "ring") {
+                allreduce_ring(t, op, rank, world, mesh);
+            } else {
+                allreduce_tree(t, op, rank, world, mesh);
             }
-
-            std::vector<std::thread> ts;
-            ts.reserve(world - 1);
-            for (int p = 0; p < world; ++p) {
-                if (p == rank) continue;
-                ts.emplace_back([mesh, p, send_sb, nbytes, &recv_bufs] {
-                    mesh->send(p, send_sb.data, nbytes);
-                    mesh->recv(p, recv_bufs[p].data(), nbytes);
-                });
-            }
-            for (auto& th : ts) th.join();
-
-            metal_begin_batch("mccl:allreduce");
-            for (int p = 0; p < world; ++p) {
-                if (p == rank) continue;
-                unstage_from_recv(peer_tmp[p], recv_bufs[p].data(), nbytes);
-                metal_reduce_op(t, peer_tmp[p], op);
-            }
-            if (op == c10d::ReduceOp::AVG) {
-                metal_scale_inplace(t, 1.0 / static_cast<double>(world));
-            }
-            metal_end_batch();
         }
     },
     /*sync_cb=*/[]() { metal_sync(); });

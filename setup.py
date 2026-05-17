@@ -281,6 +281,7 @@ CPP_SOURCES = [
     "csrc/backend/WorkMCCL.cpp",
     "csrc/backend/PeerMesh.cpp",
     "csrc/backend/Progress.cpp",
+    "csrc/backend/AllreduceAlgos.cpp",
     "csrc/backend/ProcessGroupMCCL.cpp",
     "csrc/backend/MPSFallback.cpp",
     "csrc/backend/Registration.cpp",
