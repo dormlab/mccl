@@ -60,6 +60,15 @@ c10::intrusive_ptr<c10d::Work> async_submit_(
     return work;
 }
 
+void check_mps_(const at::Tensor& t, const char* op) {
+    DISTRO_CHECK(t.is_mps(),
+                 std::string(op) + ": MCCL is MPS-only; got "
+                 + std::string(c10::DeviceTypeName(t.device().type()))
+                 + " tensor");
+    DISTRO_CHECK(t.is_contiguous(),
+                 std::string(op) + ": tensor must be contiguous");
+}
+
 std::string key(const char* op, uint64_t seq, int r) {
     return std::string("mccl/") + op + "/" + std::to_string(seq) + "/" + std::to_string(r);
 }
@@ -102,8 +111,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         mps_event_sync();
 
         for (auto& t : tensors_copy) {
-            DISTRO_CHECK(t.is_contiguous(),
-                         "allreduce: input must be contiguous");
+            check_mps_(t, "allreduce");
 
             auto send_sb = stage_for_send_nosync(t);
             size_t nbytes = send_sb.nbytes;
@@ -157,8 +165,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
         "mccl:broadcast", [mesh, rank, world, root, tensors_copy]() mutable {
         if (rank == root) mps_event_sync();
         for (auto& t : tensors_copy) {
-            DISTRO_CHECK(t.is_contiguous(),
-                         "broadcast: tensor must be contiguous");
+            check_mps_(t, "broadcast");
             if (rank == root) {
                 auto send_sb = stage_for_send_nosync(t);
                 size_t nbytes = send_sb.nbytes;
@@ -192,14 +199,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
     }
     at::Tensor out_copy = output_tensor;
     at::Tensor in_copy = input_tensor;
-    DISTRO_CHECK(in_copy.is_contiguous() && out_copy.is_contiguous(),
-                 "_allgather_base: input/output must be contiguous");
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::_ALLGATHER_BASE,
         {output_tensor}, "mccl:_allgather_base",
         [mesh, rank, world, out_copy, in_copy]() mutable {
+        check_mps_(in_copy, "_allgather_base");
+        check_mps_(out_copy, "_allgather_base");
         mps_event_sync();
         auto send_sb = stage_for_send_nosync(in_copy);
         size_t chunk = send_sb.nbytes;
@@ -252,8 +259,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             auto& outs = outs_copy[i];
             DISTRO_CHECK(static_cast<int>(outs.size()) == world,
                          "allgather: output list size != world");
-            DISTRO_CHECK(in.is_contiguous(),
-                         "allgather: input must be contiguous");
+            check_mps_(in, "allgather");
+            for (auto& o : outs) check_mps_(o, "allgather");
 
             auto send_sb = stage_for_send_nosync(in);
             size_t chunk = send_sb.nbytes;
@@ -294,14 +301,14 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
     auto op = opts.reduceOp;
     at::Tensor out_copy = output_tensor;
     at::Tensor in_copy = input_tensor;
-    DISTRO_CHECK(in_copy.is_contiguous() && out_copy.is_contiguous(),
-                 "_reduce_scatter_base: input/output must be contiguous");
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::_REDUCE_SCATTER_BASE,
         {output_tensor}, "mccl:_reduce_scatter_base",
         [mesh, rank, world, op, out_copy, in_copy]() mutable {
+        check_mps_(in_copy, "_reduce_scatter_base");
+        check_mps_(out_copy, "_reduce_scatter_base");
         mps_event_sync();
         auto send_sb = stage_for_send_nosync(in_copy);
         size_t chunk = static_cast<size_t>(out_copy.nbytes());
@@ -374,10 +381,10 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             DISTRO_CHECK(static_cast<int>(ins.size()) == world,
                          "reduce_scatter: input list size != world");
 
+            check_mps_(out, "reduce_scatter");
             std::vector<StagingBuffer> send_sbs(world);
             for (int p = 0; p < world; ++p) {
-                DISTRO_CHECK(ins[p].is_contiguous(),
-                             "reduce_scatter: inputs must be contiguous");
+                check_mps_(ins[p], "reduce_scatter");
                 send_sbs[p] = stage_for_send_nosync(ins[p]);
             }
             size_t chunk = send_sbs[0].nbytes;
@@ -437,8 +444,6 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
-    DISTRO_CHECK(in_copy.is_contiguous() && out_copy.is_contiguous(),
-                 "alltoall_base: input/output must be contiguous");
     return async_submit_(*engine_, c10d::OpType::ALLTOALL_BASE,
         {output_tensor}, "mccl:alltoall_base",
         [mesh, rank, world, out_copy, in_copy, out_splits_copy, in_splits_copy]() mutable {
@@ -446,6 +451,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
         auto& input_tensor = in_copy;
         auto& output_split_sizes = out_splits_copy;
         auto& input_split_sizes = in_splits_copy;
+        check_mps_(input_tensor, "alltoall_base");
+        check_mps_(output_tensor, "alltoall_base");
 
         mps_event_sync();
         auto send_sb = stage_for_send_nosync(input_tensor);
@@ -529,8 +536,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
         std::vector<StagingBuffer> send_sbs(world);
         std::vector<std::vector<uint8_t>> recv_bufs(world);
         for (int p = 0; p < world; ++p) {
-            DISTRO_CHECK(ins_copy[p].is_contiguous() && outs_copy[p].is_contiguous(),
-                         "alltoall: inputs/outputs must be contiguous");
+            check_mps_(ins_copy[p], "alltoall");
+            check_mps_(outs_copy[p], "alltoall");
             send_sbs[p] = stage_for_send_nosync(ins_copy[p]);
             if (p == rank) continue;
             recv_bufs[p].resize(static_cast<size_t>(outs_copy[p].nbytes()));
@@ -580,7 +587,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
         [mesh, dst_rank, tag, tensors_copy]() mutable {
         mps_event_sync();
         for (auto& t : tensors_copy) {
-            DISTRO_CHECK(t.is_contiguous(), "send: tensor must be contiguous");
+            check_mps_(t, "send");
             auto sb = stage_for_send_nosync(t);
             uint32_t nbytes = static_cast<uint32_t>(sb.nbytes);
             int32_t hdr[2] = {tag, static_cast<int32_t>(nbytes)};
@@ -599,6 +606,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     return async_submit_(*engine_, c10d::OpType::RECV, tensors, "mccl:recv",
         [mesh, src_rank, tag, tensors_copy]() mutable {
         for (auto& t : tensors_copy) {
+            check_mps_(t, "recv");
             int32_t hdr[2] = {0, 0};
             mesh->recv(src_rank, hdr, sizeof(hdr));
             DISTRO_CHECK(tag < 0 || hdr[0] == tag,
