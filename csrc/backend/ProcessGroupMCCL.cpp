@@ -203,32 +203,38 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
     }
     at::Tensor out_copy = output_tensor;
     at::Tensor in_copy = input_tensor;
+    DISTRO_CHECK(in_copy.is_contiguous() && out_copy.is_contiguous(),
+                 "_allgather_base: input/output must be contiguous");
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
     return async_submit_(*engine_, c10d::OpType::_ALLGATHER_BASE,
         {output_tensor}, "mccl:_allgather_base",
         [mesh, rank, world, out_copy, in_copy]() mutable {
-        auto in_cpu = in_copy.contiguous().cpu();
-        size_t chunk = in_cpu.nbytes();
-        DISTRO_CHECK(out_copy.nbytes() == chunk * world,
+        mps_event_sync();
+        auto send_sb = stage_for_send_nosync(in_copy);
+        size_t chunk = send_sb.nbytes;
+        size_t total = static_cast<size_t>(out_copy.nbytes());
+        DISTRO_CHECK(total == chunk * world,
                      "_allgather_base: output size != input * world");
-        auto out_cpu = at::empty(out_copy.sizes(),
-                                 out_copy.options().device(at::kCPU));
-        auto* dst = static_cast<uint8_t*>(out_cpu.data_ptr());
-        std::memcpy(dst + rank * chunk, in_cpu.data_ptr(), chunk);
+
+        std::vector<uint8_t> staging(total);
+        auto* dst = staging.data();
+        std::memcpy(dst + rank * chunk, send_sb.data, chunk);
+
         std::vector<std::thread> ts;
         ts.reserve(world - 1);
         for (int p = 0; p < world; ++p) {
             if (p == rank) continue;
-            ts.emplace_back([mesh, p, &in_cpu, chunk, dst] {
-                mesh->send(p, in_cpu.data_ptr(), chunk);
+            ts.emplace_back([mesh, p, send_sb, chunk, dst] {
+                mesh->send(p, send_sb.data, chunk);
                 mesh->recv(p, dst + p * chunk, chunk);
             });
         }
         for (auto& th : ts) th.join();
-        out_copy.copy_(out_cpu);
-    });
+        unstage_from_recv(out_copy, staging.data(), total);
+    },
+    /*sync_cb=*/[]() { metal_sync(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
