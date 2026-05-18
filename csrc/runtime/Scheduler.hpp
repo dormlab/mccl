@@ -7,7 +7,7 @@
 #include <mutex>
 #include <chrono>
 
-namespace distro {
+namespace mccl {
 
 enum class JobPriority : uint8_t {
     LOW      = 0,
@@ -131,4 +131,4 @@ private:
     std::atomic<bool> running_{false};
 };
 
-} // namespace distro
+} // namespace mccl

@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <algorithm>
 
-namespace distro {
+namespace mccl {
 
 MemoryPool::MemoryPool(size_t alignment) : alignment_(alignment) {}
 
@@ -125,4 +125,4 @@ MemoryPool& staging_memory_pool() {
     return pool;
 }
 
-} // namespace distro
+} // namespace mccl

@@ -2,7 +2,7 @@
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 
-namespace distro {
+namespace mccl {
 
 Rendezvous::Rendezvous(c10::intrusive_ptr<c10d::Store> store,
                        int rank, int world_size,
@@ -78,4 +78,4 @@ void Rendezvous::barrier(const std::string& tag) {
     DISTRO_DEBUG("Rank %d: barrier '%s' passed", rank_, tag.c_str());
 }
 
-} // namespace distro
+} // namespace mccl

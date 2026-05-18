@@ -1,16 +1,22 @@
 #include "backend/ProcessGroupMCCL.hpp"
 #include "backend/WorkMCCL.hpp"
 #include "backend/PeerMesh.hpp"
+#include "backend/Progress.hpp"
+#include "backend/AllreduceAlgos.hpp"
+#include "metal/MPSInterop.hpp"
+#include "metal/MetalKernels.hpp"
+#include "metal/EventSync.hpp"
 #include "runtime/Rendezvous.hpp"
 #include "common/Errors.hpp"
 
 #include <ATen/ATen.h>
 
 #include <cstring>
+#include <functional>
 #include <string>
 #include <thread>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
@@ -36,29 +42,40 @@ c10::intrusive_ptr<c10d::Work> make_unimplemented(
             std::string(title) + ": not implemented")));
 }
 
-std::vector<uint8_t> tensor_to_bytes(const at::Tensor& t) {
-    auto c = t.contiguous().cpu();
-    std::vector<uint8_t> b(c.nbytes());
-    std::memcpy(b.data(), c.data_ptr(), b.size());
-    return b;
+c10::intrusive_ptr<c10d::Work> async_submit_(
+    Progress& engine,
+    c10d::OpType op,
+    std::vector<at::Tensor> outputs,
+    const char* title,
+    std::function<void()> body,
+    std::function<void()> sync_cb = {}) {
+    // commit_mps_and_signal touches torch's MPS dispatch queue via
+    // dispatch_sync; call it on the issuing thread before handing the
+    // body off, then wait for the signal on the engine thread. Doing
+    // both inside the engine task can deadlock because the engine
+    // thread doesn't own torch's per-thread Metal command-buffer state.
+    uint64_t sync_val = mps_event_sync_nonblocking();
+    auto work = c10::make_intrusive<WorkMCCL>(op, std::move(outputs), title);
+    if (sync_cb) work->setSyncCallback(std::move(sync_cb));
+    engine.submit([work, body = std::move(body), sync_val]() {
+        try {
+            if (sync_val > 0) wait_for_mps(sync_val);
+            body();
+            work->finish();
+        } catch (...) {
+            work->finishWithException(std::current_exception());
+        }
+    });
+    return work;
 }
 
-at::Tensor bytes_to_cpu_like(const std::vector<uint8_t>& b, const at::Tensor& tmpl) {
-    auto t = at::empty(tmpl.sizes(), tmpl.options().device(at::kCPU));
-    DISTRO_CHECK(b.size() == static_cast<size_t>(t.nbytes()), "size mismatch");
-    std::memcpy(t.data_ptr(), b.data(), b.size());
-    return t;
-}
-
-void cpu_reduce_(at::Tensor& dst, const at::Tensor& src, c10d::ReduceOp::RedOpType op) {
-    switch (op) {
-        case c10d::ReduceOp::SUM:
-        case c10d::ReduceOp::AVG:     dst.add_(src); break;
-        case c10d::ReduceOp::PRODUCT: dst.mul_(src); break;
-        case c10d::ReduceOp::MIN:     at::min_out(dst, dst, src); break;
-        case c10d::ReduceOp::MAX:     at::max_out(dst, dst, src); break;
-        default: throw MCCLError("unsupported ReduceOp");
-    }
+void check_mps_(const at::Tensor& t, const char* op) {
+    DISTRO_CHECK(t.is_mps(),
+                 std::string(op) + ": MCCL is MPS-only; got "
+                 + std::string(c10::DeviceTypeName(t.device().type()))
+                 + " tensor");
+    DISTRO_CHECK(t.is_contiguous(),
+                 std::string(op) + ": tensor must be contiguous");
 }
 
 std::string key(const char* op, uint64_t seq, int r) {
@@ -73,11 +90,13 @@ ProcessGroupMCCL::ProcessGroupMCCL(c10::intrusive_ptr<c10d::Store> store,
       store_(std::move(store)),
       opts_(opts) {
     DISTRO_CHECK(rank >= 0 && rank < size, "rank/size invalid");
+    metal_kernels_init();
     if (size > 1) {
         rendezvous_ = std::make_unique<Rendezvous>(
             store_, rank, size, opts_.timeout);
         mesh_ = std::make_unique<PeerMesh>(
             store_, rank, size, opts_.timeout);
+        engine_ = std::make_unique<Progress>();
     }
 }
 
@@ -88,35 +107,85 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     if (getSize() == 1) {
         return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
     }
-    try {
-        auto op = opts.reduceOp;
-        for (auto& t : tensors) {
-            auto src = t.contiguous().cpu();
-            auto acc = src.is_same(t) ? src : src.clone();
-            size_t nbytes = acc.nbytes();
-            std::vector<at::Tensor> recvbufs(getSize());
-            std::vector<std::thread> ts;
-            ts.reserve(getSize() - 1);
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                recvbufs[p] = at::empty_like(acc);
-                ts.emplace_back([&, p] {
-                    mesh_->send(p, acc.data_ptr(), nbytes);
-                    mesh_->recv(p, recvbufs[p].data_ptr(), nbytes);
-                });
-            }
-            for (auto& th : ts) th.join();
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                cpu_reduce_(acc, recvbufs[p], op);
-            }
-            if (op == c10d::ReduceOp::AVG) acc.div_(getSize());
-            if (!acc.is_same(t)) t.copy_(acc);
+    DISTRO_CHECK(!tensors.empty(), "allreduce: empty tensor list");
+    auto op = opts.reduceOp;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+
+    // Optional bf16 wire compression. When MCCL_WIRE_DTYPE=bf16 and the
+    // input is fp32, we run the entire ring/tree in bf16 — half the
+    // bytes on the wire, half the bytes through the Metal reduce kernel.
+    // The fp32→bf16 / bf16→fp32 casts are MPS ops on torch's stream and
+    // are amortised by the network savings on Thunderbolt-bound runs.
+    bool wire_bf16 = [] {
+        const char* w = std::getenv("MCCL_WIRE_DTYPE");
+        return w && std::string(w) == "bf16";
+    }();
+
+    std::vector<AllreduceArgs> argv;
+    std::vector<std::string> algv;
+    std::vector<at::Tensor> work_tensors;  // keeps bf16 scratch alive
+    argv.reserve(tensors.size());
+    algv.reserve(tensors.size());
+    work_tensors.reserve(tensors.size());
+    for (auto& t : tensors) {
+        check_mps_(t, "allreduce");
+
+        at::Tensor wt = (wire_bf16 && t.scalar_type() == at::kFloat)
+                            ? t.to(at::kBFloat16) : t;
+        size_t bytes = static_cast<size_t>(wt.nbytes());
+
+        const char* env_alg = std::getenv("MCCL_ALLREDUCE_ALGO");
+        std::string alg = env_alg ? env_alg : "auto";
+        if (alg == "auto") {
+            size_t tree_below = 256ull * 1024;
+            if (const char* e = std::getenv("MCCL_TREE_BELOW"))
+                tree_below = std::strtoull(e, nullptr, 10);
+            alg = (bytes <= tree_below) ? "tree" : "ring";
         }
-    } catch (...) {
-        return make_failed(c10d::OpType::ALLREDUCE, tensors,
-                           "mccl:allreduce", std::current_exception());
+        if (alg == "ring" && wt.numel() < world) alg = "tree";
+
+        AllreduceArgs a;
+        a.t_view  = extract_mps_buffer(wt);
+        a.dtype   = wt.scalar_type();
+        a.numel   = static_cast<uint32_t>(wt.numel());
+
+        if (alg == "ring") {
+            int64_t per = (wt.numel() + world - 1) / world;
+            a.recv_scratch = at::empty({per}, wt.options());
+        } else {
+            a.recv_scratch = at::empty_like(wt);
+        }
+        a.recv_view = extract_mps_buffer(a.recv_scratch);
+
+        argv.push_back(std::move(a));
+        algv.push_back(std::move(alg));
+        work_tensors.push_back(std::move(wt));
     }
+
+    // Inline-sync. The MPSEvent-based async path runs but is flaky:
+    // even with PYTORCH_MPS_TRACE_SIGNPOSTS=1 disabling
+    // commitAndContinue, a few-step DDP loop intermittently aborts
+    // with "commit an already committed command buffer" (Metal-level,
+    // not MPSGraph). Root cause unresolved — likely in our own
+    // metal kernel drain interacting with concurrent torch commits.
+    // Need more instrumentation; leaving the wiring in place
+    // (env-var auto-set + MPSEvent recording) so the next attempt
+    // can swap allreduce back to async_submit_ once the secondary
+    // race is fixed.
+    mps_stream_sync();
+    for (size_t i = 0; i < argv.size(); ++i) {
+        if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
+        else                    allreduce_tree(argv[i], op, rank, world, mesh);
+    }
+    mccl_queue_drain();
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (work_tensors[i].data_ptr() != tensors[i].data_ptr()) {
+            tensors[i].copy_(work_tensors[i].to(tensors[i].scalar_type()));
+        }
+    }
+    if (wire_bf16) mps_stream_sync();
     return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
 }
 
@@ -125,30 +194,38 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
     if (getSize() == 1) {
         return make_completed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
     }
-    try {
-        int root = opts.rootRank;
-        for (auto& t : tensors) {
-            auto cpu = t.contiguous().cpu();
-            size_t nbytes = cpu.nbytes();
-            if (getRank() == root) {
+    DISTRO_CHECK(!tensors.empty(), "broadcast: empty tensor list");
+    auto tensors_copy = tensors;
+    int root = opts.rootRank;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::BROADCAST, tensors,
+        "mccl:broadcast", [mesh, rank, world, root, tensors_copy]() mutable {
+        
+        for (auto& t : tensors_copy) {
+            check_mps_(t, "broadcast");
+            if (rank == root) {
+                auto send_sb = stage_for_send_nosync(t);
+                size_t nbytes = send_sb.nbytes;
                 std::vector<std::thread> ts;
-                for (int p = 0; p < getSize(); ++p) {
+                ts.reserve(world - 1);
+                for (int p = 0; p < world; ++p) {
                     if (p == root) continue;
-                    ts.emplace_back([&, p] {
-                        mesh_->send(p, cpu.data_ptr(), nbytes);
+                    ts.emplace_back([mesh, p, send_sb, nbytes] {
+                        mesh->send(p, send_sb.data, nbytes);
                     });
                 }
                 for (auto& th : ts) th.join();
             } else {
-                mesh_->recv(root, cpu.data_ptr(), nbytes);
-                t.copy_(cpu);
+                size_t nbytes = static_cast<size_t>(t.nbytes());
+                std::vector<uint8_t> buf(nbytes);
+                mesh->recv(root, buf.data(), nbytes);
+                unstage_from_recv(t, buf.data(), nbytes);
             }
         }
-    } catch (...) {
-        return make_failed(c10d::OpType::BROADCAST, tensors,
-                           "mccl:broadcast", std::current_exception());
-    }
-    return make_completed(c10d::OpType::BROADCAST, tensors, "mccl:broadcast");
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
@@ -159,38 +236,45 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
         return make_completed(c10d::OpType::_ALLGATHER_BASE,
                               {output_tensor}, "mccl:_allgather_base");
     }
-    try {
-        auto in_cpu = input_tensor.contiguous().cpu();
-        size_t chunk = in_cpu.nbytes();
-        DISTRO_CHECK(output_tensor.nbytes() == chunk * getSize(),
+    at::Tensor out_copy = output_tensor;
+    at::Tensor in_copy = input_tensor;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::_ALLGATHER_BASE,
+        {output_tensor}, "mccl:_allgather_base",
+        [mesh, rank, world, out_copy, in_copy]() mutable {
+        check_mps_(in_copy, "_allgather_base");
+        check_mps_(out_copy, "_allgather_base");
+        auto send_sb = stage_for_send_nosync(in_copy);
+        size_t chunk = send_sb.nbytes;
+        size_t total = static_cast<size_t>(out_copy.nbytes());
+        DISTRO_CHECK(total == chunk * world,
                      "_allgather_base: output size != input * world");
-        auto out_cpu = at::empty(output_tensor.sizes(),
-                                 output_tensor.options().device(at::kCPU));
-        auto* dst = static_cast<uint8_t*>(out_cpu.data_ptr());
-        std::memcpy(dst + getRank() * chunk, in_cpu.data_ptr(), chunk);
+
+        std::vector<uint8_t> staging(total);
+        auto* dst = staging.data();
+        std::memcpy(dst + rank * chunk, send_sb.data, chunk);
+
         std::vector<std::thread> ts;
-        ts.reserve(getSize() - 1);
-        for (int p = 0; p < getSize(); ++p) {
-            if (p == getRank()) continue;
-            ts.emplace_back([&, p] {
-                mesh_->send(p, in_cpu.data_ptr(), chunk);
-                mesh_->recv(p, dst + p * chunk, chunk);
+        ts.reserve(world - 1);
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            ts.emplace_back([mesh, p, send_sb, chunk, dst] {
+                mesh->send(p, send_sb.data, chunk);
+                mesh->recv(p, dst + p * chunk, chunk);
             });
         }
         for (auto& th : ts) th.join();
-        output_tensor.copy_(out_cpu);
-    } catch (...) {
-        return make_failed(c10d::OpType::_ALLGATHER_BASE, {output_tensor},
-                           "mccl:_allgather_base", std::current_exception());
-    }
-    return make_completed(c10d::OpType::_ALLGATHER_BASE,
-                          {output_tensor}, "mccl:_allgather_base");
+        unstage_from_recv(out_copy, staging.data(), total);
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
     std::vector<std::vector<at::Tensor>>& output_tensors,
     std::vector<at::Tensor>& input_tensors,
-    const c10d::AllgatherOptions& opts) {
+    const c10d::AllgatherOptions& /*opts*/) {
     if (getSize() == 1) {
         DISTRO_CHECK(!output_tensors.empty() && !output_tensors[0].empty(),
                      "allgather output empty");
@@ -198,44 +282,49 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
         return make_completed(c10d::OpType::ALLGATHER,
                               output_tensors[0], "mccl:allgather");
     }
-    try {
-        DISTRO_CHECK(input_tensors.size() == output_tensors.size(),
+    auto outs_copy = output_tensors;
+    auto ins_copy = input_tensors;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::ALLGATHER, input_tensors,
+        "mccl:allgather", [mesh, rank, world, outs_copy, ins_copy]() mutable {
+        DISTRO_CHECK(ins_copy.size() == outs_copy.size(),
                      "allgather: input/output count mismatch");
-        for (size_t i = 0; i < input_tensors.size(); ++i) {
-            auto& in = input_tensors[i];
-            auto& outs = output_tensors[i];
-            DISTRO_CHECK(static_cast<int>(outs.size()) == getSize(),
+        for (size_t i = 0; i < ins_copy.size(); ++i) {
+            auto& in = ins_copy[i];
+            auto& outs = outs_copy[i];
+            DISTRO_CHECK(static_cast<int>(outs.size()) == world,
                          "allgather: output list size != world");
-            auto in_cpu = in.contiguous().cpu();
-            size_t chunk = in_cpu.nbytes();
-            std::vector<at::Tensor> peer_cpu(getSize());
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                peer_cpu[p] = at::empty(outs[p].sizes(),
-                                        outs[p].options().device(at::kCPU));
+            check_mps_(in, "allgather");
+            for (auto& o : outs) check_mps_(o, "allgather");
+
+            auto send_sb = stage_for_send_nosync(in);
+            size_t chunk = send_sb.nbytes;
+            std::vector<std::vector<uint8_t>> peer_buf(world);
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                peer_buf[p].resize(chunk);
             }
             std::vector<std::thread> ts;
-            ts.reserve(getSize() - 1);
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                ts.emplace_back([&, p] {
-                    mesh_->send(p, in_cpu.data_ptr(), chunk);
-                    mesh_->recv(p, peer_cpu[p].data_ptr(), chunk);
+            ts.reserve(world - 1);
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                ts.emplace_back([mesh, p, send_sb, chunk, &peer_buf] {
+                    mesh->send(p, send_sb.data, chunk);
+                    mesh->recv(p, peer_buf[p].data(), chunk);
                 });
             }
             for (auto& th : ts) th.join();
-            outs[getRank()].copy_(in_cpu);
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                outs[p].copy_(peer_cpu[p]);
+
+            unstage_from_recv(outs[rank], send_sb.data, chunk);
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                unstage_from_recv(outs[p], peer_buf[p].data(), chunk);
             }
         }
-        (void)opts;
-    } catch (...) {
-        return make_failed(c10d::OpType::ALLGATHER, input_tensors,
-                           "mccl:allgather", std::current_exception());
-    }
-    return make_completed(c10d::OpType::ALLGATHER, input_tensors, "mccl:allgather");
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
@@ -246,44 +335,57 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
         return make_completed(c10d::OpType::_REDUCE_SCATTER_BASE,
                               {output_tensor}, "mccl:_reduce_scatter_base");
     }
-    try {
-        auto op = opts.reduceOp;
-        auto in_cpu = input_tensor.contiguous().cpu();
-        size_t chunk = output_tensor.nbytes();
-        DISTRO_CHECK(in_cpu.nbytes() == chunk * getSize(),
+    auto op = opts.reduceOp;
+    at::Tensor out_copy = output_tensor;
+    at::Tensor in_copy = input_tensor;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::_REDUCE_SCATTER_BASE,
+        {output_tensor}, "mccl:_reduce_scatter_base",
+        [mesh, rank, world, op, out_copy, in_copy]() mutable {
+        check_mps_(in_copy, "_reduce_scatter_base");
+        check_mps_(out_copy, "_reduce_scatter_base");
+        auto send_sb = stage_for_send_nosync(in_copy);
+        size_t chunk = static_cast<size_t>(out_copy.nbytes());
+        DISTRO_CHECK(send_sb.nbytes == chunk * world,
                      "_reduce_scatter_base: input size != output * world");
-        auto* src = static_cast<uint8_t*>(in_cpu.data_ptr());
-        auto acc = at::empty(output_tensor.sizes(),
-                             output_tensor.options().device(at::kCPU));
-        std::memcpy(acc.data_ptr(), src + getRank() * chunk, chunk);
-        std::vector<at::Tensor> recvbufs(getSize());
-        for (int p = 0; p < getSize(); ++p) {
-            if (p == getRank()) continue;
-            recvbufs[p] = at::empty(output_tensor.sizes(),
-                                    output_tensor.options().device(at::kCPU));
+
+        // Seed output with our own share; we then reduce peers' shares into it.
+        const auto* src = static_cast<const uint8_t*>(send_sb.data);
+        unstage_from_recv(out_copy, src + rank * chunk, chunk);
+
+        std::vector<at::Tensor> peer_tmp(world);
+        std::vector<std::vector<uint8_t>> recv_bufs(world);
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            peer_tmp[p] = at::empty_like(out_copy);
+            recv_bufs[p].resize(chunk);
         }
+
         std::vector<std::thread> ts;
-        ts.reserve(getSize() - 1);
-        for (int p = 0; p < getSize(); ++p) {
-            if (p == getRank()) continue;
-            ts.emplace_back([&, p] {
-                mesh_->send(p, src + p * chunk, chunk);
-                mesh_->recv(p, recvbufs[p].data_ptr(), chunk);
+        ts.reserve(world - 1);
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            ts.emplace_back([mesh, p, src, chunk, &recv_bufs] {
+                mesh->send(p, src + p * chunk, chunk);
+                mesh->recv(p, recv_bufs[p].data(), chunk);
             });
         }
         for (auto& th : ts) th.join();
-        for (int p = 0; p < getSize(); ++p) {
-            if (p == getRank()) continue;
-            cpu_reduce_(acc, recvbufs[p], op);
+
+        metal_begin_batch("mccl:_reduce_scatter_base");
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            unstage_from_recv(peer_tmp[p], recv_bufs[p].data(), chunk);
+            metal_reduce_op(out_copy, peer_tmp[p], op);
         }
-        if (op == c10d::ReduceOp::AVG) acc.div_(getSize());
-        output_tensor.copy_(acc);
-    } catch (...) {
-        return make_failed(c10d::OpType::_REDUCE_SCATTER_BASE, {output_tensor},
-                           "mccl:_reduce_scatter_base", std::current_exception());
-    }
-    return make_completed(c10d::OpType::_REDUCE_SCATTER_BASE,
-                          {output_tensor}, "mccl:_reduce_scatter_base");
+        if (op == c10d::ReduceOp::AVG) {
+            metal_scale_inplace(out_copy, 1.0 / static_cast<double>(world));
+        }
+        metal_end_batch();
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
@@ -297,47 +399,67 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
         return make_completed(c10d::OpType::REDUCE_SCATTER,
                               output_tensors, "mccl:reduce_scatter");
     }
-    try {
-        auto op = opts.reduceOp;
-        DISTRO_CHECK(output_tensors.size() == input_tensors.size(),
+    auto op = opts.reduceOp;
+    auto outs_copy = output_tensors;
+    auto ins_copy = input_tensors;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::REDUCE_SCATTER, output_tensors,
+        "mccl:reduce_scatter",
+        [mesh, rank, world, op, outs_copy, ins_copy]() mutable {
+        DISTRO_CHECK(outs_copy.size() == ins_copy.size(),
                      "reduce_scatter: count mismatch");
-        for (size_t i = 0; i < output_tensors.size(); ++i) {
-            auto& outs = output_tensors[i];
-            auto& ins = input_tensors[i];
-            DISTRO_CHECK(static_cast<int>(ins.size()) == getSize(),
+        for (size_t i = 0; i < outs_copy.size(); ++i) {
+            auto& out = outs_copy[i];
+            auto& ins = ins_copy[i];
+            DISTRO_CHECK(static_cast<int>(ins.size()) == world,
                          "reduce_scatter: input list size != world");
-            std::vector<at::Tensor> ins_cpu(getSize());
-            for (int p = 0; p < getSize(); ++p) ins_cpu[p] = ins[p].contiguous().cpu();
-            size_t chunk = ins_cpu[0].nbytes();
-            auto acc = ins_cpu[getRank()].clone();
-            std::vector<at::Tensor> recvbufs(getSize());
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                recvbufs[p] = at::empty_like(ins_cpu[getRank()]);
+
+            check_mps_(out, "reduce_scatter");
+            std::vector<StagingBuffer> send_sbs(world);
+            for (int p = 0; p < world; ++p) {
+                check_mps_(ins[p], "reduce_scatter");
+                send_sbs[p] = stage_for_send_nosync(ins[p]);
             }
+            size_t chunk = send_sbs[0].nbytes;
+            DISTRO_CHECK(static_cast<size_t>(out.nbytes()) == chunk,
+                         "reduce_scatter: output size != input chunk size");
+
+            unstage_from_recv(out, send_sbs[rank].data, chunk);
+
+            std::vector<at::Tensor> peer_tmp(world);
+            std::vector<std::vector<uint8_t>> recv_bufs(world);
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                peer_tmp[p] = at::empty_like(out);
+                recv_bufs[p].resize(chunk);
+            }
+
             std::vector<std::thread> ts;
-            ts.reserve(getSize() - 1);
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                ts.emplace_back([&, p] {
-                    mesh_->send(p, ins_cpu[p].data_ptr(), chunk);
-                    mesh_->recv(p, recvbufs[p].data_ptr(), chunk);
+            ts.reserve(world - 1);
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                ts.emplace_back([mesh, p, sb = send_sbs[p], chunk, &recv_bufs] {
+                    mesh->send(p, sb.data, chunk);
+                    mesh->recv(p, recv_bufs[p].data(), chunk);
                 });
             }
             for (auto& th : ts) th.join();
-            for (int p = 0; p < getSize(); ++p) {
-                if (p == getRank()) continue;
-                cpu_reduce_(acc, recvbufs[p], op);
+
+            metal_begin_batch("mccl:reduce_scatter");
+            for (int p = 0; p < world; ++p) {
+                if (p == rank) continue;
+                unstage_from_recv(peer_tmp[p], recv_bufs[p].data(), chunk);
+                metal_reduce_op(out, peer_tmp[p], op);
             }
-            if (op == c10d::ReduceOp::AVG) acc.div_(getSize());
-            outs.copy_(acc);
+            if (op == c10d::ReduceOp::AVG) {
+                metal_scale_inplace(out, 1.0 / static_cast<double>(world));
+            }
+            metal_end_batch();
         }
-    } catch (...) {
-        return make_failed(c10d::OpType::REDUCE_SCATTER, output_tensors,
-                           "mccl:reduce_scatter", std::current_exception());
-    }
-    return make_completed(c10d::OpType::REDUCE_SCATTER, output_tensors,
-                          "mccl:reduce_scatter");
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
@@ -350,67 +472,79 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
         return make_completed(c10d::OpType::ALLTOALL_BASE,
                               {output_tensor}, "mccl:alltoall_base");
     }
-    try {
-        auto in_cpu = input_tensor.contiguous().cpu();
-        auto out_cpu = at::empty(output_tensor.sizes(),
-                                 output_tensor.options().device(at::kCPU));
-        size_t esize = static_cast<size_t>(in_cpu.element_size());
-        DISTRO_CHECK(esize == static_cast<size_t>(out_cpu.element_size()),
-                     "alltoall_base: dtype mismatch");
+    at::Tensor out_copy = output_tensor;
+    at::Tensor in_copy = input_tensor;
+    auto out_splits_copy = output_split_sizes;
+    auto in_splits_copy = input_split_sizes;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::ALLTOALL_BASE,
+        {output_tensor}, "mccl:alltoall_base",
+        [mesh, rank, world, out_copy, in_copy, out_splits_copy, in_splits_copy]() mutable {
+        auto& output_tensor = out_copy;
+        auto& input_tensor = in_copy;
+        auto& output_split_sizes = out_splits_copy;
+        auto& input_split_sizes = in_splits_copy;
+        check_mps_(input_tensor, "alltoall_base");
+        check_mps_(output_tensor, "alltoall_base");
 
-        std::vector<size_t> in_off(getSize() + 1, 0), out_off(getSize() + 1, 0);
+        auto send_sb = stage_for_send_nosync(input_tensor);
+        size_t esize = static_cast<size_t>(input_tensor.element_size());
+        DISTRO_CHECK(esize == static_cast<size_t>(output_tensor.element_size()),
+                     "alltoall_base: dtype mismatch");
+        size_t out_bytes = static_cast<size_t>(output_tensor.nbytes());
+
+        std::vector<size_t> in_off(world + 1, 0), out_off(world + 1, 0);
         if (input_split_sizes.empty()) {
-            size_t per = in_cpu.numel() / getSize() * esize;
-            DISTRO_CHECK(per * getSize() == in_cpu.nbytes(),
+            size_t per = static_cast<size_t>(input_tensor.numel()) / world * esize;
+            DISTRO_CHECK(per * world == send_sb.nbytes,
                          "alltoall_base: input not divisible by world");
-            for (int p = 0; p < getSize(); ++p) in_off[p + 1] = in_off[p] + per;
+            for (int p = 0; p < world; ++p) in_off[p + 1] = in_off[p] + per;
         } else {
-            DISTRO_CHECK(static_cast<int>(input_split_sizes.size()) == getSize(),
+            DISTRO_CHECK(static_cast<int>(input_split_sizes.size()) == world,
                          "alltoall_base: input_split_sizes wrong length");
-            for (int p = 0; p < getSize(); ++p)
+            for (int p = 0; p < world; ++p)
                 in_off[p + 1] = in_off[p] + input_split_sizes[p] * esize;
         }
         if (output_split_sizes.empty()) {
-            size_t per = out_cpu.numel() / getSize() * esize;
-            DISTRO_CHECK(per * getSize() == out_cpu.nbytes(),
+            size_t per = static_cast<size_t>(output_tensor.numel()) / world * esize;
+            DISTRO_CHECK(per * world == out_bytes,
                          "alltoall_base: output not divisible by world");
-            for (int p = 0; p < getSize(); ++p) out_off[p + 1] = out_off[p] + per;
+            for (int p = 0; p < world; ++p) out_off[p + 1] = out_off[p] + per;
         } else {
-            DISTRO_CHECK(static_cast<int>(output_split_sizes.size()) == getSize(),
+            DISTRO_CHECK(static_cast<int>(output_split_sizes.size()) == world,
                          "alltoall_base: output_split_sizes wrong length");
-            for (int p = 0; p < getSize(); ++p)
+            for (int p = 0; p < world; ++p)
                 out_off[p + 1] = out_off[p] + output_split_sizes[p] * esize;
         }
 
-        auto* src = static_cast<uint8_t*>(in_cpu.data_ptr());
-        auto* dst = static_cast<uint8_t*>(out_cpu.data_ptr());
+        const auto* src = static_cast<const uint8_t*>(send_sb.data);
+        std::vector<uint8_t> dst_buf(out_bytes);
+        auto* dst = dst_buf.data();
 
-        size_t self_in_len  = in_off[getRank() + 1]  - in_off[getRank()];
-        size_t self_out_len = out_off[getRank() + 1] - out_off[getRank()];
+        size_t self_in_len  = in_off[rank + 1]  - in_off[rank];
+        size_t self_out_len = out_off[rank + 1] - out_off[rank];
         DISTRO_CHECK(self_in_len == self_out_len,
                      "alltoall_base: self chunk size mismatch");
-        std::memcpy(dst + out_off[getRank()], src + in_off[getRank()], self_in_len);
+        std::memcpy(dst + out_off[rank], src + in_off[rank], self_in_len);
 
         std::vector<std::thread> ts;
-        ts.reserve(getSize() - 1);
-        for (int p = 0; p < getSize(); ++p) {
-            if (p == getRank()) continue;
+        ts.reserve(world - 1);
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
             size_t slen = in_off[p + 1]  - in_off[p];
             size_t rlen = out_off[p + 1] - out_off[p];
             if (slen == 0 && rlen == 0) continue;
-            ts.emplace_back([&, p, slen, rlen] {
-                if (slen) mesh_->send(p, src + in_off[p], slen);
-                if (rlen) mesh_->recv(p, dst + out_off[p], rlen);
+            ts.emplace_back([mesh, p, src, dst, &in_off, &out_off, slen, rlen] {
+                if (slen) mesh->send(p, src + in_off[p], slen);
+                if (rlen) mesh->recv(p, dst + out_off[p], rlen);
             });
         }
         for (auto& th : ts) th.join();
-        output_tensor.copy_(out_cpu);
-    } catch (...) {
-        return make_failed(c10d::OpType::ALLTOALL_BASE, {output_tensor},
-                           "mccl:alltoall_base", std::current_exception());
-    }
-    return make_completed(c10d::OpType::ALLTOALL_BASE,
-                          {output_tensor}, "mccl:alltoall_base");
+        unstage_from_recv(output_tensor, dst_buf.data(), out_bytes);
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
@@ -425,73 +559,88 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
         return make_completed(c10d::OpType::ALLTOALL,
                               output_tensors, "mccl:alltoall");
     }
-    try {
-        std::vector<at::Tensor> in_cpu(getSize()), out_cpu(getSize());
-        for (int p = 0; p < getSize(); ++p) {
-            in_cpu[p]  = input_tensors[p].contiguous().cpu();
-            out_cpu[p] = at::empty(output_tensors[p].sizes(),
-                                   output_tensors[p].options().device(at::kCPU));
+    auto outs_copy = output_tensors;
+    auto ins_copy = input_tensors;
+    PeerMesh* mesh = mesh_.get();
+    int rank = getRank();
+    int world = getSize();
+    return async_submit_(*engine_, c10d::OpType::ALLTOALL, output_tensors,
+        "mccl:alltoall", [mesh, rank, world, outs_copy, ins_copy]() mutable {
+        std::vector<StagingBuffer> send_sbs(world);
+        std::vector<std::vector<uint8_t>> recv_bufs(world);
+        for (int p = 0; p < world; ++p) {
+            check_mps_(ins_copy[p], "alltoall");
+            check_mps_(outs_copy[p], "alltoall");
+            send_sbs[p] = stage_for_send_nosync(ins_copy[p]);
+            if (p == rank) continue;
+            recv_bufs[p].resize(static_cast<size_t>(outs_copy[p].nbytes()));
         }
-        out_cpu[getRank()].copy_(in_cpu[getRank()]);
+
+        unstage_from_recv(outs_copy[rank], send_sbs[rank].data,
+                          send_sbs[rank].nbytes);
 
         std::vector<std::thread> ts;
-        ts.reserve(getSize() - 1);
-        for (int p = 0; p < getSize(); ++p) {
-            if (p == getRank()) continue;
-            ts.emplace_back([&, p] {
-                mesh_->send(p, in_cpu[p].data_ptr(), in_cpu[p].nbytes());
-                mesh_->recv(p, out_cpu[p].data_ptr(), out_cpu[p].nbytes());
+        ts.reserve(world - 1);
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            ts.emplace_back([mesh, p, sb = send_sbs[p], &recv_bufs] {
+                mesh->send(p, sb.data, sb.nbytes);
+                mesh->recv(p, recv_bufs[p].data(), recv_bufs[p].size());
             });
         }
         for (auto& th : ts) th.join();
-        for (int p = 0; p < getSize(); ++p) output_tensors[p].copy_(out_cpu[p]);
-    } catch (...) {
-        return make_failed(c10d::OpType::ALLTOALL, output_tensors,
-                           "mccl:alltoall", std::current_exception());
-    }
-    return make_completed(c10d::OpType::ALLTOALL, output_tensors, "mccl:alltoall");
+
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            unstage_from_recv(outs_copy[p], recv_bufs[p].data(),
+                              recv_bufs[p].size());
+        }
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
     const c10d::BarrierOptions& /*opts*/) {
-    if (getSize() > 1 && rendezvous_) {
-        try {
-            rendezvous_->barrier("pg_barrier_" + std::to_string(next_seq_()));
-        } catch (...) {
-            return make_failed(c10d::OpType::BARRIER, {},
-                               "mccl:barrier", std::current_exception());
-        }
+    if (getSize() == 1 || !rendezvous_) {
+        return make_completed(c10d::OpType::BARRIER, {}, "mccl:barrier");
     }
-    return make_completed(c10d::OpType::BARRIER, {}, "mccl:barrier");
+    Rendezvous* rv = rendezvous_.get();
+    std::string tag = "pg_barrier_" + std::to_string(next_seq_());
+    return async_submit_(*engine_, c10d::OpType::BARRIER, {}, "mccl:barrier",
+        [rv, tag]() { rv->barrier(tag); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::send(
     std::vector<at::Tensor>& tensors, int dst_rank, int tag) {
     DISTRO_CHECK(dst_rank >= 0 && dst_rank < getSize() && dst_rank != getRank(),
                  "send: bad dst_rank");
-    try {
-        for (auto& t : tensors) {
-            auto cpu = t.contiguous().cpu();
-            uint32_t nbytes = static_cast<uint32_t>(cpu.nbytes());
+    auto tensors_copy = tensors;
+    PeerMesh* mesh = mesh_.get();
+    return async_submit_(*engine_, c10d::OpType::SEND, tensors, "mccl:send",
+        [mesh, dst_rank, tag, tensors_copy]() mutable {
+        for (auto& t : tensors_copy) {
+            check_mps_(t, "send");
+            auto sb = stage_for_send_nosync(t);
+            uint32_t nbytes = static_cast<uint32_t>(sb.nbytes);
             int32_t hdr[2] = {tag, static_cast<int32_t>(nbytes)};
-            mesh_->send(dst_rank, hdr, sizeof(hdr));
-            mesh_->send(dst_rank, cpu.data_ptr(), nbytes);
+            mesh->send(dst_rank, hdr, sizeof(hdr));
+            mesh->send(dst_rank, sb.data, nbytes);
         }
-    } catch (...) {
-        return make_failed(c10d::OpType::SEND, tensors,
-                           "mccl:send", std::current_exception());
-    }
-    return make_completed(c10d::OpType::SEND, tensors, "mccl:send");
+    });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
     std::vector<at::Tensor>& tensors, int src_rank, int tag) {
     DISTRO_CHECK(src_rank >= 0 && src_rank < getSize() && src_rank != getRank(),
                  "recv: bad src_rank");
-    try {
-        for (auto& t : tensors) {
+    auto tensors_copy = tensors;
+    PeerMesh* mesh = mesh_.get();
+    return async_submit_(*engine_, c10d::OpType::RECV, tensors, "mccl:recv",
+        [mesh, src_rank, tag, tensors_copy]() mutable {
+        for (auto& t : tensors_copy) {
+            check_mps_(t, "recv");
             int32_t hdr[2] = {0, 0};
-            mesh_->recv(src_rank, hdr, sizeof(hdr));
+            mesh->recv(src_rank, hdr, sizeof(hdr));
             DISTRO_CHECK(tag < 0 || hdr[0] == tag,
                          "recv: tag mismatch (expected " + std::to_string(tag)
                          + " got " + std::to_string(hdr[0]) + ")");
@@ -499,15 +648,12 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
             DISTRO_CHECK(nbytes == t.nbytes(),
                          "recv: size mismatch (expected " + std::to_string(t.nbytes())
                          + " got " + std::to_string(nbytes) + ")");
-            auto cpu = at::empty(t.sizes(), t.options().device(at::kCPU));
-            mesh_->recv(src_rank, cpu.data_ptr(), nbytes);
-            t.copy_(cpu);
+            std::vector<uint8_t> buf(nbytes);
+            mesh->recv(src_rank, buf.data(), nbytes);
+            unstage_from_recv(t, buf.data(), nbytes);
         }
-    } catch (...) {
-        return make_failed(c10d::OpType::RECV, tensors,
-                           "mccl:recv", std::current_exception());
-    }
-    return make_completed(c10d::OpType::RECV, tensors, "mccl:recv");
+    },
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Backend> ProcessGroupMCCL::create(
@@ -519,4 +665,4 @@ c10::intrusive_ptr<c10d::Backend> ProcessGroupMCCL::create(
     return c10::make_intrusive<ProcessGroupMCCL>(store, rank, size, opts);
 }
 
-} // namespace distro
+} // namespace mccl

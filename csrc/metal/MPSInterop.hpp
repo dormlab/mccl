@@ -3,8 +3,9 @@
 #include <torch/torch.h>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
-namespace distro {
+namespace mccl {
 
 struct MPSBufferView {
     void* mtl_buffer;       // id<MTLBuffer> — stored as void* for C++ header
@@ -30,7 +31,7 @@ void mps_stream_sync();
 
 /// Drain only the MCCL command queue (blocks until all committed MCCL
 /// command buffers complete). Does NOT flush the PyTorch MPS stream.
-void distro_queue_drain();
+void mccl_queue_drain();
 
 /// Event-based MPS sync for compute-communication overlap.
 /// Non-blocking: encode signal + commit on PyTorch's MPS command buffer.
@@ -74,6 +75,13 @@ at::Tensor ensure_shared_storage(const at::Tensor& tensor);
 void* get_mtl_device();
 
 /// Get or create a dedicated MTLCommandQueue for MCCL operations.
-void* get_distro_command_queue();
+void* get_mccl_command_queue();
 
-} // namespace distro
+/// Run a callable on torch's MPS dispatch queue synchronously (blocks
+/// caller). Use to invoke Metal kernels from threads that don't own
+/// torch's per-thread Metal command-buffer state — direct Metal kernel
+/// dispatch from such threads hangs in the encoder. Exceptions are
+/// rethrown on the caller.
+void on_mps_thread(std::function<void()> fn);
+
+} // namespace mccl

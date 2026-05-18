@@ -9,7 +9,7 @@
 
 #include "dmem/DistributedMemoryManager.hpp"
 
-namespace distro {
+namespace mccl {
 
 /// Per-page coherence state tracked at the home node.
 enum class CoherenceState : uint8_t {
@@ -75,4 +75,4 @@ private:
     mutable std::mutex mu_;
 };
 
-} // namespace distro
+} // namespace mccl

@@ -6,7 +6,7 @@
 #include <vector>
 #include <string>
 
-namespace distro {
+namespace mccl {
 
 /// Describes how a compute shader is partitioned across nodes.
 ///
@@ -121,4 +121,4 @@ inline ShaderDispatch ShaderDispatch::data_parallel(
     return sd;
 }
 
-} // namespace distro
+} // namespace mccl

@@ -5,7 +5,7 @@
 
 #include <utility>
 
-namespace distro {
+namespace mccl {
 
 ProgressEngine::ProgressEngine(size_t max_queue_depth, Metrics* metrics)
     : max_depth_(max_queue_depth), metrics_(metrics) {
@@ -24,7 +24,7 @@ void ProgressEngine::start() {
     thread_ = std::thread(&ProgressEngine::worker_loop, this);
 
 #if defined(__APPLE__)
-    pthread_setname_np("distro_engine");
+    pthread_setname_np("mccl_engine");
 #endif
 
     DISTRO_INFO("ProgressEngine started (max_depth=%zu)", max_depth_);
@@ -156,4 +156,4 @@ void ProgressEngine::worker_loop() {
     DISTRO_DEBUG("ProgressEngine worker thread exiting");
 }
 
-} // namespace distro
+} // namespace mccl

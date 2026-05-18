@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-distro CLI — submit jobs, query cluster status, manage nodes.
+mccl CLI — submit jobs, query cluster status, manage nodes.
 
 Usage::
 
     # Show cluster status
-    distro status
+    mccl status
 
     # Submit a training job
-    distro submit --name "llama-7b-finetune" --nodes 3 --memory 16GB
+    mccl submit --name "llama-7b-finetune" --nodes 3 --memory 16GB
 
     # List active jobs
-    distro jobs
+    mccl jobs
 
     # Cancel a job
-    distro cancel --job-id 42
+    mccl cancel --job-id 42
 
     # Watch the scheduler queue live
-    distro watch
+    mccl watch
 """
 
 from __future__ import annotations
@@ -30,10 +30,10 @@ import time
 from typing import Optional
 
 
-# ── These resolve once distro._C is built ──────────────────────────────────
+# ── These resolve once mccl._C is built ──────────────────────────────────
 try:
-    import distro
-    from distro._C import init_dmem, shutdown_dmem, get_stats
+    import mccl
+    from mccl._C import init_dmem, shutdown_dmem, get_stats
     HAS_DISTRO = True
 except ImportError:
     HAS_DISTRO = False
@@ -42,11 +42,11 @@ except ImportError:
 def cmd_status(args) -> None:
     """Print cluster node status."""
     if not HAS_DISTRO:
-        print("distro native extension not built. Run: pip install -e .")
+        print("mccl native extension not built. Run: pip install -e .")
         sys.exit(1)
 
     stats = get_stats()
-    print("┌─ distro Cluster Status ─────────────────────────────────┐")
+    print("┌─ mccl Cluster Status ─────────────────────────────────┐")
     print(f"│  DMEM puts:  {stats['total_put_bytes'] / 1e9:>8.2f} GB  "
           f"({stats['total_put_ops']} ops)")
     print(f"│  DMEM gets:  {stats['total_get_bytes'] / 1e9:>8.2f} GB  "
@@ -58,7 +58,7 @@ def cmd_status(args) -> None:
 def cmd_submit(args) -> None:
     """Submit a job to the cluster scheduler."""
     if not HAS_DISTRO:
-        print("distro native extension not built. Run: pip install -e .")
+        print("mccl native extension not built. Run: pip install -e .")
         sys.exit(1)
 
     # Parse memory string (e.g., "16GB" → bytes)
@@ -74,7 +74,7 @@ def cmd_submit(args) -> None:
     print("\nJob submission via ClusterManager (requires head node).")
     print("The head node's ClusterManager.scheduler_loop() will allocate")
     print("resources on the next tick.")
-    print(f"\n  distro submit --name {args.name} --nodes {args.nodes} "
+    print(f"\n  mccl submit --name {args.name} --nodes {args.nodes} "
           f"--memory {args.memory}")
 
 
@@ -121,12 +121,58 @@ def parse_memory(s: str) -> int:
     return int(s)  # Raw bytes
 
 
+def cmd_check(args) -> None:
+    """Verify TB + Tailscale + Python + extension are configured."""
+    from mccl.check import run_all
+    sys.exit(run_all())
+
+
+def cmd_test(args) -> None:
+    """Run the mccl test suite via pytest."""
+    if args.worlds:
+        os.environ["MCCL_TEST_WORLDS"] = args.worlds
+    import subprocess
+    targets = args.targets or ["tests/unit", "tests/integration"]
+    cmd = [sys.executable, "-m", "pytest", *targets]
+    if args.verbose:
+        cmd.append("-v")
+    if args.k:
+        cmd.extend(["-k", args.k])
+    if args.markers:
+        cmd.extend(["-m", args.markers])
+    print(f"+ MCCL_TEST_WORLDS={os.environ.get('MCCL_TEST_WORLDS', '2,3')} "
+          + " ".join(cmd))
+    sys.exit(subprocess.call(cmd))
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="distro — Distributed Metal GPU Runtime CLI",
-        prog="distro",
+        description="mccl — Distributed Metal GPU Runtime CLI",
+        prog="mccl",
     )
+    parser.add_argument("--test", action="store_true",
+                        help="Run the test suite (shortcut for `mccl test`).")
+    parser.add_argument("--check", action="store_true",
+                        help="Verify TB + Tailscale setup (shortcut for `mccl check`).")
+    parser.add_argument("--worlds", default=None,
+                        help="Comma-separated world sizes for --test "
+                             "(e.g. --worlds 2,3,4,8).")
     sub = parser.add_subparsers(dest="command")
+
+    # check
+    sub.add_parser("check", help="Verify TB / Tailscale / extension setup"
+                  ).set_defaults(func=cmd_check)
+
+    # test
+    p = sub.add_parser("test", help="Run the test suite")
+    p.add_argument("targets", nargs="*",
+                   help="Test paths to run (default: tests/unit tests/integration)")
+    p.add_argument("--worlds", default=None,
+                   help="Comma-separated world sizes (overrides MCCL_TEST_WORLDS).")
+    p.add_argument("-k", default=None, help="pytest -k expression")
+    p.add_argument("-m", "--markers", default=None, help="pytest -m expression")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(func=cmd_test)
 
     # status
     sub.add_parser("status", help="Show cluster status").set_defaults(func=cmd_status)
@@ -153,6 +199,18 @@ def main():
     sub.add_parser("watch", help="Watch scheduler queue").set_defaults(func=cmd_watch)
 
     args = parser.parse_args()
+    if args.check:
+        cmd_check(args)
+        return
+    if args.test:
+        # Shorthand: `mccl --test` → `mccl test`
+        if not hasattr(args, "func"):
+            args.targets = []
+            args.k = None
+            args.markers = None
+            args.verbose = True
+        cmd_test(args)
+        return
     if args.command is None:
         parser.print_help()
         sys.exit(1)

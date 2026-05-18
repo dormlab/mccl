@@ -2,6 +2,8 @@
 #import <Foundation/Foundation.h>
 #import <torch/torch.h>
 #import <torch/mps.h>
+#import <ATen/mps/MPSStream.h>
+#import <ATen/mps/MPSEvent.h>
 
 #include "metal/EventSync.hpp"
 #include "metal/MPSInterop.hpp"
@@ -9,17 +11,19 @@
 #include "common/Logging.hpp"
 
 #include <atomic>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
-namespace distro {
+namespace mccl {
 
 namespace {
 
 struct EventState {
     id<MTLSharedEvent> mps_event   = nil;
-    id<MTLSharedEvent> distro_event  = nil;
+    id<MTLSharedEvent> mccl_event  = nil;
     id<MTLDevice>      device      = nil;
-    id<MTLCommandQueue> distro_queue = nil;
+    id<MTLCommandQueue> mccl_queue = nil;
     std::atomic<uint64_t> counter{0};
     std::atomic<bool> initialized{false};
 };
@@ -72,7 +76,7 @@ void event_sync_init() {
             return;
         }
 
-        s.distro_queue = (__bridge id<MTLCommandQueue>)get_distro_command_queue();
+        s.mccl_queue = (__bridge id<MTLCommandQueue>)get_mccl_command_queue();
 
         s.mps_event = [s.device newSharedEvent];
         if (!s.mps_event) {
@@ -80,9 +84,9 @@ void event_sync_init() {
             return;
         }
 
-        s.distro_event = [s.device newSharedEvent];
-        if (!s.distro_event) {
-            DISTRO_WARN("EventSync: MTLSharedEvent creation failed (distro_event)");
+        s.mccl_event = [s.device newSharedEvent];
+        if (!s.mccl_event) {
+            DISTRO_WARN("EventSync: MTLSharedEvent creation failed (mccl_event)");
             s.mps_event = nil;
             return;
         }
@@ -97,36 +101,52 @@ bool event_sync_available() {
     return state().initialized.load(std::memory_order_acquire);
 }
 
+namespace {
+
+// Pending events keyed by the sequence value returned from
+// mps_event_sync_nonblocking. The calling thread records the event on
+// torch's current MPS stream; the engine thread looks it up by value
+// and waits.
+std::mutex g_pending_mu;
+std::unordered_map<uint64_t, at::mps::MPSEventPtr> g_pending;
+
+}  // namespace
+
 void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
-    // Encode a signal on PyTorch's active MPS command buffer then commit it.
-    // dispatch_sync on PyTorch's serial queue guarantees our encoding happens
-    // AFTER all backward/forward work dispatched so far.  commit() submits the
-    // buffer; the MTLSharedEvent fires when the GPU finishes that buffer.
-    //
-    // This replaces the old torch::mps::synchronize() full-stream-drain and is
-    // safe to call mid-backward: dispatch_sync serializes with PyTorch's own
-    // encoding, and commit() just submits -- PyTorch lazily creates a new
-    // command buffer for subsequent ops.
-    dispatch_sync(
-        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
-            id<MTLCommandBuffer> cmd =
-                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
-            [cmd encodeSignalEvent:s.mps_event value:value];
-            torch::mps::commit();
-        });
-    // Non-blocking: caller waits via wait_for_mps() when it needs the data.
+    // Use torch's at::mps::MPSEvent — the public cross-thread sync
+    // primitive on the MPS backend. record(needsLock=true) takes the
+    // stream's internal lock before touching the command buffer, so
+    // this is safe to call from any thread, including DDP's reducer
+    // hook on the autograd thread while MPSGraph is encoding ops on
+    // the same stream. The engine thread waits on the event later
+    // (wait_for_mps → synchronize), which blocks until torch commits
+    // its current MPS buffer and the GPU finishes it.
+    auto stream = at::mps::getCurrentMPSStream();
+    auto event = at::mps::getMPSEventPool()->acquireEvent(/*enable_timing=*/false, stream);
+    event->record(/*needsLock=*/true);
+    std::lock_guard<std::mutex> lk(g_pending_mu);
+    g_pending.emplace(value, std::move(event));
 }
 
 void wait_for_mps(uint64_t value) {
-    EventState& s = state();
-    DISTRO_CHECK(s.initialized, "EventSync not initialized");
-    spin_wait_event(s.mps_event, value);
+    at::mps::MPSEventPtr event;
+    {
+        std::lock_guard<std::mutex> lk(g_pending_mu);
+        auto it = g_pending.find(value);
+        if (it == g_pending.end()) return;
+        event = std::move(it->second);
+        g_pending.erase(it);
+    }
+    // Blocks until the recorded point on torch's MPS stream has been
+    // executed on the GPU. Releases the engine thread to read CPU-side
+    // bytes from the unified-memory buffer safely.
+    event->synchronize();
 }
 
-void signal_distro_done(uint64_t value) {
+void signal_mccl_done(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
@@ -134,17 +154,17 @@ void signal_distro_done(uint64_t value) {
     // to unified memory -- just update the event counter so anyone polling
     // knows we're done.  For the Metal shader path we encode the signal on
     // MCCL's command queue and commit.
-    s.distro_event.signaledValue = value;
+    s.mccl_event.signaledValue = value;
 }
 
-void signal_distro_done_gpu(uint64_t value) {
+void signal_mccl_done_gpu(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
     @autoreleasepool {
-        id<MTLCommandBuffer> cmd = [s.distro_queue commandBuffer];
-        cmd.label = @"distro_signal_done";
-        [cmd encodeSignalEvent:s.distro_event value:value];
+        id<MTLCommandBuffer> cmd = [s.mccl_queue commandBuffer];
+        cmd.label = @"mccl_signal_done";
+        [cmd encodeSignalEvent:s.mccl_event value:value];
         [cmd commit];
     }
 }
@@ -152,11 +172,11 @@ void signal_distro_done_gpu(uint64_t value) {
 void wait_for_mccl(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
-    spin_wait_event(s.distro_event, value);
+    spin_wait_event(s.mccl_event, value);
 }
 
 uint64_t next_event_value() {
     return state().counter.fetch_add(1) + 1;
 }
 
-} // namespace distro
+} // namespace mccl

@@ -11,7 +11,7 @@
 #include <mutex>
 #include <vector>
 
-namespace distro {
+namespace mccl {
 
 /// c10d::Work for MCCL collectives.
 ///
@@ -62,4 +62,4 @@ private:
     std::function<void()> sync_cb_;
 };
 
-} // namespace distro
+} // namespace mccl

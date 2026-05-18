@@ -10,7 +10,7 @@ import copy
 import torch
 import torch.nn as nn
 
-from distro._C import (
+from mccl._C import (
     register_region,
     unregister_region,
     put,
@@ -18,7 +18,7 @@ from distro._C import (
     poll_completion,
     drain_pending,
 )
-from distro.distributed.tensor import DistributedTensor, ShardingSpec
+from mccl.distributed.tensor import DistributedTensor, ShardingSpec
 
 
 class ModelParallelPlan:

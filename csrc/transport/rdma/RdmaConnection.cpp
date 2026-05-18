@@ -5,7 +5,7 @@
 #include <cstring>
 #include <utility>
 
-namespace distro {
+namespace mccl {
 
 RdmaConnection::RdmaConnection() = default;
 
@@ -323,4 +323,4 @@ int RdmaConnection::poll(int max_wc, ibv_wc* wc_out) {
     return fns_->poll_cq(cq_, max_wc, wc_out);
 }
 
-} // namespace distro
+} // namespace mccl

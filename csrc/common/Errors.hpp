@@ -4,7 +4,7 @@
 #include <string>
 #include <sstream>
 
-namespace distro {
+namespace mccl {
 
 class MCCLError : public std::runtime_error {
 public:
@@ -45,24 +45,24 @@ public:
 #define DISTRO_CHECK(cond, ...)                                          \
     do {                                                                \
         if (!(cond)) {                                                  \
-            std::ostringstream _distro_ss;                                \
-            _distro_ss << "Check failed: " #cond " at "                  \
+            std::ostringstream _mccl_ss;                                \
+            _mccl_ss << "Check failed: " #cond " at "                  \
                      << __FILE__ << ":" << __LINE__;                    \
             std::string _extra = std::string(__VA_ARGS__);              \
-            if (!_extra.empty()) _distro_ss << " — " << _extra;          \
-            throw ::distro::MCCLError(_distro_ss.str());                   \
+            if (!_extra.empty()) _mccl_ss << " — " << _extra;          \
+            throw ::mccl::MCCLError(_mccl_ss.str());                   \
         }                                                               \
     } while (false)
 
 #define DISTRO_CHECK_TENSOR(cond, ...)                                   \
     do {                                                                \
         if (!(cond)) {                                                  \
-            std::ostringstream _distro_ss;                                \
-            _distro_ss << "Tensor check failed: " #cond;                 \
+            std::ostringstream _mccl_ss;                                \
+            _mccl_ss << "Tensor check failed: " #cond;                 \
             std::string _extra = std::string(__VA_ARGS__);              \
-            if (!_extra.empty()) _distro_ss << " — " << _extra;          \
-            throw ::distro::TensorError(_distro_ss.str());                 \
+            if (!_extra.empty()) _mccl_ss << " — " << _extra;          \
+            throw ::mccl::TensorError(_mccl_ss.str());                 \
         }                                                               \
     } while (false)
 
-} // namespace distro
+} // namespace mccl

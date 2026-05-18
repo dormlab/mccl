@@ -12,13 +12,9 @@ import warnings as _warnings
 _REGISTERED = False
 
 DEFAULT_IFACE_PRIORITY = (
-    "10.",
-    "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
-    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.",
-    "172.28.", "172.29.", "172.30.", "172.31.",
-    "192.168.",
-    "100.",
-    "169.254.",
+    "192.168.101.",
+    "192.168.102.",
+    "192.168.103.",
 )
 
 
@@ -26,7 +22,7 @@ def set_iface_priority(prefixes):
     """Set the IPv4 prefix priority used to pick the best peer route.
 
     Earlier prefixes win. Pass before init_process_group. Example:
-        distro.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
+        mccl.set_iface_priority(["192.168.103.", "192.168.102.", "192.168."])
     """
     _os.environ["MCCL_IFACE_PRIORITY"] = ",".join(prefixes)
 
@@ -39,6 +35,19 @@ def register() -> bool:
 
     _os.environ.setdefault("MCCL_IFACE_PRIORITY", ",".join(DEFAULT_IFACE_PRIORITY))
 
+    # Disable torch's MPS commitAndContinue. mccl records at::mps::MPSEvent
+    # objects on torch's MPS stream from a non-encoding thread (DDP reducer
+    # hook, mccl Progress engine). With commitAndContinue on, torch reuses
+    # the same MPSCommandBuffer across commits — MPSGraph holds a reference
+    # while we record, the buffer flips to "committed" mid-encode, and
+    # MPSPredicate aborts with "command buffer already committed". Disabling
+    # commitAndContinue makes commit() flush+release the buffer instead;
+    # each new operation allocates a fresh MPSCommandBuffer. The
+    # PYTORCH_MPS_TRACE_SIGNPOSTS=1 env var is the existing knob that flips
+    # this in torch (see aten/src/ATen/mps/MPSStream.mm:25). MUST be set
+    # before any torch.mps API is touched.
+    _os.environ.setdefault("PYTORCH_MPS_TRACE_SIGNPOSTS", "1")
+
     try:
         import torch.distributed as dist
     except ImportError:
@@ -47,10 +56,10 @@ def register() -> bool:
         return False
 
     try:
-        from distro._C import _create_process_group_mccl
+        from mccl._C import _create_process_group_mccl
     except ImportError as e:
         _warnings.warn(
-            f"distro._C native extension missing _create_process_group_mccl: {e}",
+            f"mccl._C native extension missing _create_process_group_mccl: {e}",
             RuntimeWarning, stacklevel=2)
         return False
 
@@ -58,7 +67,12 @@ def register() -> bool:
         td = timeout if isinstance(timeout, _dt.timedelta) else _dt.timedelta(seconds=1800)
         return _create_process_group_mccl(prefix_store, rank, world_size, td)
 
-    # Newer torch (≥2.1) accepts a `devices` kwarg; fall back if not.
+    # MCCL is MPS-only — the PG body runs Metal kernels and rejects CPU tensors
+    # via check_mps_ (see ProcessGroupMCCL.cpp). "cpu" stays in the device list
+    # purely as a dispatcher-routing artifact: MPSFallback.cpp redispatches the
+    # c10d ops from the MPS key into the CPU key, where torch ships a generic
+    # shim that pulls the ProcessGroup off the op stack and calls our PG. No
+    # CPU compute runs through MCCL.
     try:
         dist.Backend.register_backend("mccl", _create, devices=["cpu", "mps"])
     except TypeError:

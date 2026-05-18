@@ -16,7 +16,7 @@ from typing import List, Tuple, Optional, Dict
 import ctypes
 import torch
 
-from distro._C import (
+from mccl._C import (
     register_region,
     unregister_region,
     put,
