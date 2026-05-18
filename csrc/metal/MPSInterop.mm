@@ -8,6 +8,7 @@
 
 #include "metal/MPSInterop.hpp"
 #include "metal/EventSync.hpp"
+#include "metal/CommitTrace.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
@@ -109,7 +110,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                         toBuffer:pool.mtl_wrapper destinationOffset:0
                             size:nbytes];
             [blit endEncoding];
-            [cmd commit];
+            MCCL_COMMIT(cmd, "blit_to_staging_fast");
             [cmd waitUntilCompleted];
             check_command_buffer(cmd, "chunked_blit_to_staging(fast)");
         }
@@ -143,7 +144,7 @@ void chunked_blit_to_staging(id<MTLBuffer> src_buf, size_t src_offset,
                         toBuffer:chunk_mtl destinationOffset:0
                             size:chunk];
             [blit endEncoding];
-            [cmd commit];
+            MCCL_COMMIT(cmd, "blit_to_staging_chunk");
             [cmd waitUntilCompleted];
             check_command_buffer(cmd, "chunked_blit_to_staging(chunk)");
         }
@@ -163,7 +164,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
                         toBuffer:dst_buf destinationOffset:dst_offset
                             size:nbytes];
             [blit endEncoding];
-            [cmd commit];
+            MCCL_COMMIT(cmd, "blit_from_staging_fast");
             [cmd waitUntilCompleted];
             check_command_buffer(cmd, "chunked_blit_from_staging(fast)");
         }
@@ -194,7 +195,7 @@ void chunked_blit_from_staging(const void* src, size_t nbytes,
                         toBuffer:dst_buf destinationOffset:dst_offset + offset
                             size:chunk];
             [blit endEncoding];
-            [cmd commit];
+            MCCL_COMMIT(cmd, "blit_from_staging_chunk");
             [cmd waitUntilCompleted];
             check_command_buffer(cmd, "chunked_blit_from_staging(chunk)");
         }
@@ -311,7 +312,7 @@ void mps_stream_sync() {
 void mccl_queue_drain() {
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [cached_queue() commandBuffer];
-        [cmd commit];
+        MCCL_COMMIT(cmd, "mccl_queue_drain");
         [cmd waitUntilCompleted];
     }
 }

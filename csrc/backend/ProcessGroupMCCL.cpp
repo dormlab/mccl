@@ -164,16 +164,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         work_tensors.push_back(std::move(wt));
     }
 
-    // Inline-sync. The MPSEvent-based async path runs but is flaky:
-    // even with PYTORCH_MPS_TRACE_SIGNPOSTS=1 disabling
-    // commitAndContinue, a few-step DDP loop intermittently aborts
-    // with "commit an already committed command buffer" (Metal-level,
-    // not MPSGraph). Root cause unresolved — likely in our own
-    // metal kernel drain interacting with concurrent torch commits.
-    // Need more instrumentation; leaving the wiring in place
-    // (env-var auto-set + MPSEvent recording) so the next attempt
-    // can swap allreduce back to async_submit_ once the secondary
-    // race is fixed.
+    // Inline-sync. Async path was instrumented end-to-end with
+    // MCCL_COMMIT wrappers around every [cmd commit] in our code;
+    // across crashing async runs we saw zero double-commits at our
+    // sites, so the offender is inside torch's MPSStream::flush ->
+    // [_commandBuffer commit] interacting with MPSGraph mid-encode
+    // on the same buffer. Cannot fix from outside pytorch. Async
+    // works in ~1/5 runs (timing-dependent). Leaving the wiring in
+    // place — see commit_mps_and_signal / wait_for_mps in
+    // EventSync.mm.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
         if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
