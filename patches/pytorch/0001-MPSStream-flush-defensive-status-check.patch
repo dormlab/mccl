@@ -1,0 +1,20 @@
+--- /tmp/orig.mm	2026-05-18 00:11:22
++++ /tmp/pytorch-patch/aten/src/ATen/mps/MPSStream.mm	2026-05-17 23:19:04
+@@ -137,7 +137,16 @@
+ 
+ void MPSStream::flush() {
+   if (_commandBuffer) {
+-    [_commandBuffer commit];
++    // Defensive: skip [commit] if the underlying MTLCommandBuffer is no
++    // longer in NotEnqueued state. Under heavy cross-thread pressure
++    // (e.g. an external collective backend recording events on this
++    // stream during DDP backward), MPSGraph's async encoding can leave
++    // the buffer in a committed state before flush() is reached. The
++    // unguarded [commit] below then trips Metal's
++    // "commit an already committed command buffer" assertion.
++    if (_commandBuffer.status == MTLCommandBufferStatusNotEnqueued) {
++      [_commandBuffer commit];
++    }
+     // if commitAndContinue is disabled (e.g., for Profiler), we keep the command
+     // buffer so we could wait on it later, if required.
+     if (!_enableCommitAndContinue) {

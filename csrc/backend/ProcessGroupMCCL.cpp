@@ -164,15 +164,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         work_tensors.push_back(std::move(wt));
     }
 
-    // Inline-sync. Async path was instrumented end-to-end with
-    // MCCL_COMMIT wrappers around every [cmd commit] in our code;
-    // across crashing async runs we saw zero double-commits at our
-    // sites, so the offender is inside torch's MPSStream::flush ->
-    // [_commandBuffer commit] interacting with MPSGraph mid-encode
-    // on the same buffer. Cannot fix from outside pytorch. Async
-    // works in ~1/5 runs (timing-dependent). Leaving the wiring in
-    // place — see commit_mps_and_signal / wait_for_mps in
-    // EventSync.mm.
+    // Inline-sync. The patched-torch async path runs without crashing
+    // (validated 5/5) but has high run-to-run variance (30–57
+    // samples/s) — the engine's MPSEvent wait depends on torch's
+    // unpredictable commit cadence during backward, so overlap is
+    // sometimes great and sometimes worse than sync. Inline-sync is
+    // a steady ~52 samples/s. Until the variance is understood, sync
+    // wins on average. Async wiring is preserved end-to-end (env
+    // var, MPSEvent record, engine wait) — toggle by swapping this
+    // block back to async_submit_.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
         if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
