@@ -1,8 +1,23 @@
 """mccl — MCCL c10d backend for Apple Silicon."""
 from __future__ import annotations
 
+import os
 import platform
+import sys
 import warnings
+
+# Must be set BEFORE torch's MPS subsystem initializes (i.e. before any
+# tensor lives on the MPS device). Disables torch's commitAndContinue,
+# which otherwise races with mccl's MPSEvent recording during DDP
+# backward. See mccl/_backend.py::register for the full explanation.
+os.environ.setdefault("PYTORCH_MPS_TRACE_SIGNPOSTS", "1")
+if "torch" in sys.modules:
+    warnings.warn(
+        "mccl was imported AFTER torch. If a tensor has already been "
+        "placed on the MPS device, torch's commitAndContinue is already "
+        "active and DDP will hit MPSPredicate panics. Import mccl before "
+        "torch, or export PYTORCH_MPS_TRACE_SIGNPOSTS=1 in your launcher.",
+        RuntimeWarning, stacklevel=2)
 
 from mccl.version import __version__, COMPATIBILITY_MATRIX
 from mccl.config import DistroConfig

@@ -164,12 +164,16 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         work_tensors.push_back(std::move(wt));
     }
 
-    // Synchronous. Async overlap requires touching torch's MPS state
-    // (get_command_buffer + addCompletedHandler / encodeSignalEvent)
-    // from a non-encoding thread; that races with MPSGraph mid-encode
-    // during DDP backward and trips MPSPredicate. Tried both
-    // encodeSignalEvent and addCompletedHandler — same panic. Real
-    // overlap needs an upstream torch/MPS fix.
+    // Inline-sync. The MPSEvent-based async path runs but is flaky:
+    // even with PYTORCH_MPS_TRACE_SIGNPOSTS=1 disabling
+    // commitAndContinue, a few-step DDP loop intermittently aborts
+    // with "commit an already committed command buffer" (Metal-level,
+    // not MPSGraph). Root cause unresolved — likely in our own
+    // metal kernel drain interacting with concurrent torch commits.
+    // Need more instrumentation; leaving the wiring in place
+    // (env-var auto-set + MPSEvent recording) so the next attempt
+    // can swap allreduce back to async_submit_ once the secondary
+    // race is fixed.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
         if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);

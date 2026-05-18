@@ -35,6 +35,19 @@ def register() -> bool:
 
     _os.environ.setdefault("MCCL_IFACE_PRIORITY", ",".join(DEFAULT_IFACE_PRIORITY))
 
+    # Disable torch's MPS commitAndContinue. mccl records at::mps::MPSEvent
+    # objects on torch's MPS stream from a non-encoding thread (DDP reducer
+    # hook, mccl Progress engine). With commitAndContinue on, torch reuses
+    # the same MPSCommandBuffer across commits — MPSGraph holds a reference
+    # while we record, the buffer flips to "committed" mid-encode, and
+    # MPSPredicate aborts with "command buffer already committed". Disabling
+    # commitAndContinue makes commit() flush+release the buffer instead;
+    # each new operation allocates a fresh MPSCommandBuffer. The
+    # PYTORCH_MPS_TRACE_SIGNPOSTS=1 env var is the existing knob that flips
+    # this in torch (see aten/src/ATen/mps/MPSStream.mm:25). MUST be set
+    # before any torch.mps API is touched.
+    _os.environ.setdefault("PYTORCH_MPS_TRACE_SIGNPOSTS", "1")
+
     try:
         import torch.distributed as dist
     except ImportError:
