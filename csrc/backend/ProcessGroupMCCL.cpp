@@ -141,6 +141,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
             alg = (bytes <= tree_below) ? "tree" : "ring";
         }
         if (alg == "ring" && wt.numel() < world) alg = "tree";
+        if (alg == "butterfly" && (world < 2 || wt.numel() < (uint32_t)world))
+            alg = "tree";
 
         AllreduceArgs a;
         a.t_view  = extract_mps_buffer(wt);
@@ -150,6 +152,11 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         if (alg == "ring") {
             int64_t per = (wt.numel() + world - 1) / world;
             a.recv_scratch = at::empty({per}, wt.options());
+        } else if (alg == "butterfly") {
+            // (world - 1) chunks of size per
+            int64_t per = (wt.numel() + world - 1) / world;
+            a.recv_scratch = at::empty({static_cast<int64_t>(world - 1) * per},
+                                       wt.options());
         } else {
             a.recv_scratch = at::empty_like(wt);
         }
@@ -164,8 +171,9 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     // wait_for_mps) but unstable in run-to-run variance.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
-        if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
-        else                    allreduce_tree(argv[i], op, rank, world, mesh);
+        if      (algv[i] == "ring")      allreduce_ring     (argv[i], op, rank, world, mesh);
+        else if (algv[i] == "butterfly") allreduce_butterfly(argv[i], op, rank, world, mesh);
+        else                              allreduce_tree    (argv[i], op, rank, world, mesh);
     }
     mccl_queue_drain();
     for (size_t i = 0; i < tensors.size(); ++i) {
@@ -206,10 +214,15 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
                 }
                 for (auto& th : ts) th.join();
             } else {
+                // Pinned staging: recv directly into the tensor's shared
+                // MTLBuffer (UMA gives us a CPU pointer that aliases GPU
+                // memory). Skips one CPU memcpy vs the prior
+                // std::vector + unstage_from_recv path.
                 size_t nbytes = static_cast<size_t>(t.nbytes());
-                std::vector<uint8_t> buf(nbytes);
-                mesh->recv(root, buf.data(), nbytes);
-                unstage_from_recv(t, buf.data(), nbytes);
+                MPSBufferView v = extract_mps_buffer(t);
+                DISTRO_CHECK(v.cpu_accessible && v.cpu_ptr,
+                             "broadcast recv: tensor MTLBuffer not shared/cpu-accessible");
+                mesh->recv(root, v.cpu_ptr, nbytes);
             }
         }
     },

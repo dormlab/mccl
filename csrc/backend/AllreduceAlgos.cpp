@@ -131,4 +131,78 @@ void allreduce_tree(const AllreduceArgs& args,
     }
 }
 
+void allreduce_butterfly(const AllreduceArgs& args,
+                         c10d::ReduceOp::RedOpType op,
+                         int rank, int world, PeerMesh* mesh) {
+    DISTRO_CHECK(args.numel >= static_cast<uint32_t>(world),
+                 "butterfly allreduce: numel must be >= world");
+    size_t esize = static_cast<size_t>(at::elementSize(args.dtype));
+    auto chunks = chunkize(args.numel, esize, world);
+    const auto& my_chunk = chunks[rank];
+
+    // recv_view must hold (world-1) chunks of size my_chunk.byte_len.
+    DISTRO_CHECK(args.recv_view.nbytes >=
+                 static_cast<size_t>(world - 1) * my_chunk.byte_len,
+                 "butterfly: recv_view too small; allocate (world-1)*per chunks");
+
+    // Phase 1 — reduce-scatter. Each rank R sends chunks[p] to peer p
+    // (for p != R), parallel across all peers. Each rank R recvs its
+    // own chunk from each peer in parallel.
+    {
+        std::vector<std::thread> ts;
+        ts.reserve(2 * (world - 1));
+        int slot = 0;
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            const auto& s = chunks[p];
+            ts.emplace_back([&, p, s] {
+                mesh->send(p, byte_ptr(args.t_view, s.byte_off), s.byte_len);
+            });
+            size_t recv_off = static_cast<size_t>(slot) * my_chunk.byte_len;
+            ts.emplace_back([&, p, recv_off] {
+                mesh->recv(p, byte_ptr(args.recv_view, recv_off),
+                           my_chunk.byte_len);
+            });
+            slot++;
+        }
+        for (auto& t : ts) t.join();
+    }
+
+    // Reduce all (world-1) received slots into the rank's own chunk.
+    {
+        auto dst_v = view_at(args.t_view, my_chunk.byte_off);
+        for (int slot = 0; slot < world - 1; ++slot) {
+            MPSBufferView src = view_at(args.recv_view,
+                static_cast<size_t>(slot) * my_chunk.byte_len);
+            metal_reduce_op_view(dst_v, src, args.dtype,
+                                 static_cast<uint32_t>(my_chunk.elem_count), op);
+        }
+    }
+
+    // Phase 2 — allgather. Each rank broadcasts its own reduced chunk
+    // to all other peers in parallel; recvs the others' chunks in
+    // parallel into the right offsets in the user tensor.
+    {
+        std::vector<std::thread> ts;
+        ts.reserve(2 * (world - 1));
+        for (int p = 0; p < world; ++p) {
+            if (p == rank) continue;
+            const auto& s = my_chunk;
+            ts.emplace_back([&, p, s] {
+                mesh->send(p, byte_ptr(args.t_view, s.byte_off), s.byte_len);
+            });
+            const auto& r = chunks[p];
+            ts.emplace_back([&, p, r] {
+                mesh->recv(p, byte_ptr(args.t_view, r.byte_off), r.byte_len);
+            });
+        }
+        for (auto& t : ts) t.join();
+    }
+
+    if (op == c10d::ReduceOp::AVG) {
+        metal_scale_inplace_view(args.t_view, args.dtype, args.numel,
+                                 1.0 / static_cast<double>(world));
+    }
+}
+
 } // namespace mccl
