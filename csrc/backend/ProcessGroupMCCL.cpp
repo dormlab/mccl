@@ -147,15 +147,19 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         algv.push_back(std::move(alg));
     }
 
-    return async_submit_(*engine_, c10d::OpType::ALLREDUCE, tensors,
-        "mccl:allreduce",
-        [mesh, rank, world, op, argv = std::move(argv), algv = std::move(algv)]() mutable {
-        for (size_t i = 0; i < argv.size(); ++i) {
-            if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
-            else                    allreduce_tree(argv[i], op, rank, world, mesh);
-        }
-    },
-    /*sync_cb=*/[]() { metal_sync(); });
+    // Synchronous execution. The async/Progress path raced with torch's
+    // MPS command-buffer when called from inside DDP's autograd reducer
+    // hooks (`MPSPredicate: command buffer already committed`). Running
+    // inline on the calling thread, after a torch::mps::synchronize(),
+    // guarantees torch's MPS state is drained before we touch the
+    // unified-memory buffers and before the network sends start.
+    mps_stream_sync();
+    for (size_t i = 0; i < argv.size(); ++i) {
+        if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
+        else                    allreduce_tree(argv[i], op, rank, world, mesh);
+    }
+    mccl_queue_drain();
+    return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
@@ -194,7 +198,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::broadcast(
             }
         }
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
@@ -237,7 +241,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_allgather_base(
         for (auto& th : ts) th.join();
         unstage_from_recv(out_copy, staging.data(), total);
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
@@ -293,7 +297,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allgather(
             }
         }
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
@@ -354,7 +358,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::_reduce_scatter_base(
         }
         metal_end_batch();
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
@@ -428,7 +432,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::reduce_scatter(
             metal_end_batch();
         }
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
@@ -513,7 +517,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall_base(
         for (auto& th : ts) th.join();
         unstage_from_recv(output_tensor, dst_buf.data(), out_bytes);
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
@@ -565,7 +569,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::alltoall(
                               recv_bufs[p].size());
         }
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::barrier(
@@ -622,7 +626,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::recv(
             unstage_from_recv(t, buf.data(), nbytes);
         }
     },
-    /*sync_cb=*/[]() { metal_sync(); });
+    /*sync_cb=*/[]() { mccl_queue_drain(); });
 }
 
 c10::intrusive_ptr<c10d::Backend> ProcessGroupMCCL::create(

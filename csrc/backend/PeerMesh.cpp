@@ -133,7 +133,24 @@ PeerMesh::PeerMesh(c10::intrusive_ptr<c10d::Store> store,
                  "PeerMesh getsockname");
     int port = ntohs(addr.sin_port);
 
-    auto ips = local_ips();
+    auto ips_all = local_ips();
+    // Only advertise IPs whose /24 prefix is in MCCL_IFACE_PRIORITY. This
+    // keeps Wi-Fi / Ethernet interfaces out of the peer-discovery exchange
+    // entirely, so a peer can never pick them.
+    std::vector<std::string> ips;
+    {
+        const auto& pri = prefix_priority();
+        for (const auto& ip : ips_all) {
+            if (pri.empty()) { ips.push_back(ip); continue; }
+            for (const auto& p : pri) {
+                if (ip.rfind(p, 0) == 0) { ips.push_back(ip); break; }
+            }
+        }
+    }
+    DISTRO_CHECK(!ips.empty(),
+                 "PeerMesh: no local IP matches MCCL_IFACE_PRIORITY; check "
+                 "that Thunderbolt interfaces are up and the priority list "
+                 "covers their subnets");
     std::vector<std::string> my_subnets;
     my_subnets.reserve(ips.size());
     for (const auto& ip : ips) my_subnets.emplace_back(subnet24(ip));
@@ -191,13 +208,31 @@ PeerMesh::PeerMesh(c10::intrusive_ptr<c10d::Store> store,
         }
         std::vector<std::string> reachable;
         reachable.reserve(cands.size());
+        const auto& pri = prefix_priority();
         for (const auto& ip : cands) {
             auto sub = subnet24(ip);
+            bool same_subnet = false;
             for (const auto& mine : my_subnets) {
-                if (sub == mine) { reachable.push_back(ip); break; }
+                if (sub == mine) { same_subnet = true; break; }
             }
+            if (!same_subnet) continue;
+            // Hard-filter against the priority list. Without this, PeerMesh
+            // would silently fall back to non-TB interfaces (Wi-Fi /
+            // Ethernet) when a TB pair fails, dragging the whole ring down
+            // to ~1 Gbps. We want loud failures, not silent slow paths.
+            if (!pri.empty()) {
+                bool in_pri = false;
+                for (const auto& p : pri) {
+                    if (ip.rfind(p, 0) == 0) { in_pri = true; break; }
+                }
+                if (!in_pri) continue;
+            }
+            reachable.push_back(ip);
         }
-        if (reachable.empty()) reachable = cands;
+        DISTRO_CHECK(!reachable.empty(),
+                     "PeerMesh: no MCCL_IFACE_PRIORITY-matching subnet shared "
+                     "with peer " + std::to_string(p) +
+                     "; refusing to fall back to a non-priority interface");
         std::sort(reachable.begin(), reachable.end(),
                   [](const std::string& a, const std::string& b) {
                       return score(a) < score(b);

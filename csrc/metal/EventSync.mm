@@ -101,23 +101,21 @@ void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
-    // Encode a signal on PyTorch's active MPS command buffer then commit it.
-    // dispatch_sync on PyTorch's serial queue guarantees our encoding happens
-    // AFTER all backward/forward work dispatched so far.  commit() submits the
-    // buffer; the MTLSharedEvent fires when the GPU finishes that buffer.
+    // Encode a signal on torch's active command buffer but DO NOT commit.
+    // Torch will commit the buffer naturally on its next sync point (its
+    // own backward ops or a synchronize() at end of backward). At that
+    // point our signal fires and the engine thread proceeds.
     //
-    // This replaces the old torch::mps::synchronize() full-stream-drain and is
-    // safe to call mid-backward: dispatch_sync serializes with PyTorch's own
-    // encoding, and commit() just submits -- PyTorch lazily creates a new
-    // command buffer for subsequent ops.
+    // Why not commit ourselves: torch may still be encoding ops on this
+    // buffer (DDP fires reducer hooks mid-backward while MPSGraph is
+    // running on the buffer in parallel). Committing here aborts torch's
+    // in-flight encoding ("command buffer already committed").
     dispatch_sync(
         (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
             id<MTLCommandBuffer> cmd =
                 (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
             [cmd encodeSignalEvent:s.mps_event value:value];
-            torch::mps::commit();
         });
-    // Non-blocking: caller waits via wait_for_mps() when it needs the data.
 }
 
 void wait_for_mps(uint64_t value) {
