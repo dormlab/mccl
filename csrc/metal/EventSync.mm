@@ -102,31 +102,19 @@ bool event_sync_available() {
 }
 
 namespace {
-
-// Pending events keyed by the sequence value returned from
-// mps_event_sync_nonblocking. The calling thread records the event on
-// torch's current MPS stream; the engine thread looks it up by value
-// and waits.
+// Pending MPSEvents keyed by the sequence value from
+// mps_event_sync_nonblocking. Recorded by the calling thread,
+// awaited by the engine thread.
 std::mutex g_pending_mu;
 std::unordered_map<uint64_t, at::mps::MPSEventPtr> g_pending;
-
 }  // namespace
 
 void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
-
-    // Use torch's at::mps::MPSEvent — the public cross-thread sync
-    // primitive on the MPS backend. record(needsLock=true) takes the
-    // stream's internal lock before touching the command buffer, so
-    // this is safe to call from any thread, including DDP's reducer
-    // hook on the autograd thread while MPSGraph is encoding ops on
-    // the same stream. The engine thread waits on the event later
-    // (wait_for_mps → synchronize), which blocks until torch commits
-    // its current MPS buffer and the GPU finishes it.
     auto stream = at::mps::getCurrentMPSStream();
-    auto event = at::mps::getMPSEventPool()->acquireEvent(/*enable_timing=*/false, stream);
-    event->record(/*needsLock=*/true);
+    auto event = at::mps::getMPSEventPool()->acquireEvent(false, stream);
+    event->record(true);
     std::lock_guard<std::mutex> lk(g_pending_mu);
     g_pending.emplace(value, std::move(event));
 }
@@ -140,9 +128,6 @@ void wait_for_mps(uint64_t value) {
         event = std::move(it->second);
         g_pending.erase(it);
     }
-    // Blocks until the recorded point on torch's MPS stream has been
-    // executed on the GPU. Releases the engine thread to read CPU-side
-    // bytes from the unified-memory buffer safely.
     event->synchronize();
 }
 

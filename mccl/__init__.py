@@ -6,17 +6,13 @@ import platform
 import sys
 import warnings
 
-# Must be set BEFORE torch's MPS subsystem initializes (i.e. before any
-# tensor lives on the MPS device). Disables torch's commitAndContinue,
-# which otherwise races with mccl's MPSEvent recording during DDP
-# backward. See mccl/_backend.py::register for the full explanation.
+# Disables torch's MPS commitAndContinue (see _backend.py for why).
+# Must be set before torch.mps initializes.
 os.environ.setdefault("PYTORCH_MPS_TRACE_SIGNPOSTS", "1")
 if "torch" in sys.modules:
     warnings.warn(
-        "mccl was imported AFTER torch. If a tensor has already been "
-        "placed on the MPS device, torch's commitAndContinue is already "
-        "active and DDP will hit MPSPredicate panics. Import mccl before "
-        "torch, or export PYTORCH_MPS_TRACE_SIGNPOSTS=1 in your launcher.",
+        "mccl was imported after torch — set PYTORCH_MPS_TRACE_SIGNPOSTS=1 "
+        "in your launcher to avoid DDP races.",
         RuntimeWarning, stacklevel=2)
 
 from mccl.version import __version__, COMPATIBILITY_MATRIX
