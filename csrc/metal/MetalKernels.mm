@@ -7,6 +7,7 @@
 
 #include "metal/MetalKernels.hpp"
 #include "metal/MPSInterop.hpp"
+#include "metal/CommitTrace.hpp"
 #include "common/Errors.hpp"
 #include "common/Logging.hpp"
 #include "common/TensorChecks.hpp"
@@ -148,7 +149,7 @@ id<MTLCommandBuffer> acquire_command_buffer(KernelCache& c, const char* label) {
 
 void finish_command_buffer(KernelCache& c, id<MTLCommandBuffer> cmd) {
     if (c.batch_cmd == nil) {
-        [cmd commit];
+        MCCL_COMMIT(cmd, "kernel_finish");
     }
 }
 
@@ -571,7 +572,7 @@ void metal_end_batch() {
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = c.batch_cmd;
         c.batch_cmd = nil;
-        [cmd commit];
+        MCCL_COMMIT(cmd, "kernel_end_batch");
     }
 }
 

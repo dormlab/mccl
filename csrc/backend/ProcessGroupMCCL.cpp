@@ -113,11 +113,7 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     int rank = getRank();
     int world = getSize();
 
-    // Optional bf16 wire compression. When MCCL_WIRE_DTYPE=bf16 and the
-    // input is fp32, we run the entire ring/tree in bf16 — half the
-    // bytes on the wire, half the bytes through the Metal reduce kernel.
-    // The fp32→bf16 / bf16→fp32 casts are MPS ops on torch's stream and
-    // are amortised by the network savings on Thunderbolt-bound runs.
+    // MCCL_WIRE_DTYPE=bf16 runs the ring/tree in bf16 for fp32 inputs.
     bool wire_bf16 = [] {
         const char* w = std::getenv("MCCL_WIRE_DTYPE");
         return w && std::string(w) == "bf16";
@@ -164,16 +160,8 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         work_tensors.push_back(std::move(wt));
     }
 
-    // Inline-sync. The MPSEvent-based async path runs but is flaky:
-    // even with PYTORCH_MPS_TRACE_SIGNPOSTS=1 disabling
-    // commitAndContinue, a few-step DDP loop intermittently aborts
-    // with "commit an already committed command buffer" (Metal-level,
-    // not MPSGraph). Root cause unresolved — likely in our own
-    // metal kernel drain interacting with concurrent torch commits.
-    // Need more instrumentation; leaving the wiring in place
-    // (env-var auto-set + MPSEvent recording) so the next attempt
-    // can swap allreduce back to async_submit_ once the secondary
-    // race is fixed.
+    // Sync. Async overlap path is wired (commit_mps_and_signal +
+    // wait_for_mps) but unstable in run-to-run variance.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
         if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
