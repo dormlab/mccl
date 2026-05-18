@@ -112,13 +112,29 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
     PeerMesh* mesh = mesh_.get();
     int rank = getRank();
     int world = getSize();
+
+    // Optional bf16 wire compression. When MCCL_WIRE_DTYPE=bf16 and the
+    // input is fp32, we run the entire ring/tree in bf16 — half the
+    // bytes on the wire, half the bytes through the Metal reduce kernel.
+    // The fp32→bf16 / bf16→fp32 casts are MPS ops on torch's stream and
+    // are amortised by the network savings on Thunderbolt-bound runs.
+    bool wire_bf16 = [] {
+        const char* w = std::getenv("MCCL_WIRE_DTYPE");
+        return w && std::string(w) == "bf16";
+    }();
+
     std::vector<AllreduceArgs> argv;
     std::vector<std::string> algv;
+    std::vector<at::Tensor> work_tensors;  // keeps bf16 scratch alive
     argv.reserve(tensors.size());
     algv.reserve(tensors.size());
+    work_tensors.reserve(tensors.size());
     for (auto& t : tensors) {
         check_mps_(t, "allreduce");
-        size_t bytes = static_cast<size_t>(t.nbytes());
+
+        at::Tensor wt = (wire_bf16 && t.scalar_type() == at::kFloat)
+                            ? t.to(at::kBFloat16) : t;
+        size_t bytes = static_cast<size_t>(wt.nbytes());
 
         const char* env_alg = std::getenv("MCCL_ALLREDUCE_ALGO");
         std::string alg = env_alg ? env_alg : "auto";
@@ -128,37 +144,45 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
                 tree_below = std::strtoull(e, nullptr, 10);
             alg = (bytes <= tree_below) ? "tree" : "ring";
         }
-        if (alg == "ring" && t.numel() < world) alg = "tree";
+        if (alg == "ring" && wt.numel() < world) alg = "tree";
 
         AllreduceArgs a;
-        a.t_view  = extract_mps_buffer(t);
-        a.dtype   = t.scalar_type();
-        a.numel   = static_cast<uint32_t>(t.numel());
+        a.t_view  = extract_mps_buffer(wt);
+        a.dtype   = wt.scalar_type();
+        a.numel   = static_cast<uint32_t>(wt.numel());
 
         if (alg == "ring") {
-            int64_t per = (t.numel() + world - 1) / world;
-            a.recv_scratch = at::empty({per}, t.options());
+            int64_t per = (wt.numel() + world - 1) / world;
+            a.recv_scratch = at::empty({per}, wt.options());
         } else {
-            a.recv_scratch = at::empty_like(t);
+            a.recv_scratch = at::empty_like(wt);
         }
         a.recv_view = extract_mps_buffer(a.recv_scratch);
 
         argv.push_back(std::move(a));
         algv.push_back(std::move(alg));
+        work_tensors.push_back(std::move(wt));
     }
 
-    // Synchronous execution. The async/Progress path raced with torch's
-    // MPS command-buffer when called from inside DDP's autograd reducer
-    // hooks (`MPSPredicate: command buffer already committed`). Running
-    // inline on the calling thread, after a torch::mps::synchronize(),
-    // guarantees torch's MPS state is drained before we touch the
-    // unified-memory buffers and before the network sends start.
+    // Synchronous execution. Async via Metal shared events triggers
+    // MPSPredicate panics when DDP fires reducer hooks while torch's
+    // autograd is still encoding ops on the same MPS command buffer.
+    // True comm/compute overlap requires either an upstream torch fix or
+    // a PyTorch comm_hook that runs the allreduce strictly outside of
+    // backward — left as future work.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
         if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
         else                    allreduce_tree(argv[i], op, rank, world, mesh);
     }
     mccl_queue_drain();
+    // Cast bf16 work tensors back into the caller's fp32 buffer.
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        if (work_tensors[i].data_ptr() != tensors[i].data_ptr()) {
+            tensors[i].copy_(work_tensors[i].to(tensors[i].scalar_type()));
+        }
+    }
+    if (wire_bf16) mps_stream_sync();
     return make_completed(c10d::OpType::ALLREDUCE, tensors, "mccl:allreduce");
 }
 
