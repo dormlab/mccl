@@ -2,40 +2,60 @@
 
 ## Context
 
-Transforming MCCL from a `torch.distributed` collective-communications backend into a **distributed Metal runtime** for a 3-node cluster of Mac minis (Thunderbolt 5 RDMA fabric). The cluster presents as a **single logical GPU** with full PGAS, a release-consistency coherence protocol, configurable data/model sharding, and multi-tenant scheduling. ~80-85% of the current codebase is removed; the RDMA transport, Metal interop, event sync, and progress engine survive.
+Transforming MCCL from a `torch.distributed` collective-communications backend into a **distributed Metal runtime** for a 3-node cluster of Mac minis connected by a full Thunderbolt mesh. The cluster presents as a **single logical GPU** with a global address space, a release-consistency coherence protocol, configurable data/model sharding, and multi-tenant scheduling.
 
-**Key enabling insight:** Apple Silicon unified memory means `MTLBuffer.contents` is a valid CPU pointer. Registering that pointer with the RDMA NIC (`ibv_reg_mr`) gives the NIC direct DMA access to GPU memory — no bounce buffers, no driver hacks. This is GPUDirect RDMA on every Apple Silicon Mac.
+**Key enabling property of Apple Silicon:** unified memory. An `MTLBuffer` allocated with shared storage has a CPU-addressable pointer (`buffer.contents`) that aliases the same physical pages the GPU sees. That means any byte the network stack writes to that pointer is immediately visible to a GPU shader without a copy. This is the closest analog to "GPUDirect" available on macOS — not because the NIC DMAs into GPU memory (there is no RDMA NIC on a Mac), but because there is no separate GPU memory in the first place.
+
+**What this plan deliberately does *not* assume:**
+- No ibverbs / RDMA / InfiniBand. macOS has no RDMA stack. All "one-sided" semantics in this plan are implemented over TCP sockets on the Thunderbolt-bridge subnets. We keep RDMA-style *API shapes* (put/get, rkeys, completion queues) because they're a clean model, but the wire transport is TCP.
+- No kernel bypass, no MSI-X, no DPDK. macOS doesn't expose these to userspace without a DriverKit extension, which is out of scope.
+- No cross-node `MTLSharedEvent`. MTLSharedEvent is intra-process / intra-machine. Cross-node ordering uses TCP byte-order + explicit barriers.
+- No GPU peer-to-peer. There is exactly one GPU per Mac mini.
 
 ---
 
-## What Stays (~15-20%)
+## Hardware reality
+
+Per node (current cluster: 3× Mac mini, M4 / M4 Pro / M4 Max class):
+
+- **3 Thunderbolt ports** on the SoC. Currently 2 are used per node to form a full triangle, each peer-pair on its own `/24`. One port per node sits idle and is the obvious next bandwidth lever.
+- **Per-cable real throughput ~3 GB/s** over a single TCP socket on a TB-bridge subnet. Hardware ceiling per cable is higher (TB4 ≈ 5 GB/s usable, TB5 ≈ 10 GB/s usable); the gap is BSD-TCP overhead, single-stream HOL, and small socket buffers.
+- **Striping multiple sockets across multiple TB cables to the same peer scales close to linearly** until the SoC's PCIe fabric saturates. This is the single largest perf lever in the system.
+- **Unified memory bandwidth dwarfs the network** (M4 base ≈ 120 GB/s, M4 Pro ≈ 270 GB/s, M4 Max ≈ 540 GB/s). Local reductions are essentially free relative to the wire; design the system around minimizing bytes-on-wire, not around minimizing local FLOPs.
+- **Tailscale `100.x` mesh** is available on every node and used for control plane (rendezvous, membership, heartbeats). Never used for data.
+
+---
+
+## What Stays from the existing tree
 
 | Component | Files | Why |
 |---|---|---|
-| RDMA transport | `csrc/transport/rdma/{RdmaConnection,IbvWrapper,SharedBuffer}.*`, `ibverbs_compat.h` | Extended with one-sided RDMA READ/WRITE ops |
-| Metal interop | `csrc/metal/MPSInterop.mm` | `extract_mps_buffer()` gives us the CPU pointer for zero-copy RDMA registration |
-| Event sync | `csrc/metal/EventSync.mm` | MTLSharedEvent protocol extended for cross-node coherence |
-| Metal kernels | `csrc/metal/MetalKernels.mm`, `shaders.metal` | Reduction/accumulate kernels, stripped of collectives cruft |
-| Progress engine | `csrc/runtime/ProgressEngine.cpp` | Async work queue pattern reused for DMEM/coherence ops |
-| Memory pool | `csrc/runtime/MemoryPool.cpp` | Page-aligned allocator extended for distributed regions |
-| Rendezvous | `csrc/runtime/Rendezvous.cpp` | Store-based node discovery extended for cluster membership |
-| Health/Logging/Errors | `csrc/runtime/HealthMonitor.cpp`, `csrc/common/` | Peer liveness, logging macros, exception hierarchy |
-| Build system | `setup.py` patterns | clang++ with Metal/Accelerate, metallib compilation, pybind11 added |
+| Metal interop | `csrc/metal/MPSInterop.mm` | `extract_mps_buffer()` gives the CPU pointer for zero-copy network I/O |
+| Event sync (intra-node) | `csrc/metal/EventSync.mm` | MTLSharedEvent for ordering shaders against CPU-side network completion, intra-node only |
+| Metal kernels | `csrc/metal/MetalKernels.mm`, `shaders.metal` | Reduction / accumulate kernels |
+| Progress engine | `csrc/runtime/ProgressEngine.cpp` | Async work queue, reused for transport completions and coherence ops |
+| Memory pool | `csrc/runtime/MemoryPool.cpp` | Page-aligned (16 KB on Apple Silicon) allocator |
+| Rendezvous | `csrc/runtime/Rendezvous.cpp` | Store-based node discovery |
+| Health / Logging / Errors | `csrc/runtime/HealthMonitor.cpp`, `csrc/common/` | |
+| PeerMesh (TB-TCP transport) | `csrc/backend/PeerMesh.{hpp,cpp}` | Already does per-peer TCP over the TB-bridge `/24`s; extend to multi-socket striping |
+| Build system | `setup.py` | clang++ + Metal + Accelerate, metallib compilation, pybind11 |
 
-## What Gets Removed (~80-85%)
+## What Gets Removed / Reframed
 
-`csrc/backend/` (ProcessGroupMCCL, WorkMCCL, MPSDispatch, Registration), `csrc/transport/TcpTransport*`, `csrc/transport/Connection*`, `csrc/transport/Protocol.hpp`, `csrc/compression/`, `csrc/runtime/Watchdog*`, `csrc/metal/AccelerateOps*` (vDSP)
+- The previous `plan.md` described an `ibverbs` / RDMA transport (`csrc/transport/rdma/`). That code path is not viable on macOS and is being repurposed: the API surface (one-sided put/get with rkeys) is kept as an internal abstraction, but the implementation lives over TCP on TB-bridge subnets, not over verbs. Files under `csrc/transport/rdma/` will be renamed to reflect that (e.g. `csrc/transport/onesided/`).
+- TCP `Connection*` / generic `Protocol.hpp` and any compression stages tied to the old c10d backend are removed.
+- `csrc/metal/AccelerateOps*` (vDSP) and `csrc/runtime/Watchdog*` are removed.
 
 ---
 
 ## Layer 1: Distributed Memory (DMEM)
 
-Global address space: each node registers its Metal buffers with the local RDMA NIC, then advertises `(node_id, region_id, base_addr, length, rkey)` to all peers. Other nodes resolve a `GlobalAddress` → RDMA remote addr + rkey → one-sided `put()`/`get()`.
+Global address space, implemented over TCP-on-Thunderbolt. Each node "registers" a region by recording `(base_ptr, length, flags)` in a local table and assigning it a stable `region_id`. The cluster-wide catalog (`MemoryCatalog`) is a replicated directory of `(node_id, region_id, length)`; resolution to a peer's local address happens at the peer (the local table is the authoritative map). This is identical to RDMA semantics from the user's point of view; the difference is that "remote put" turns into "TCP write to the peer's daemon, which `memcpy`s into the local pointer."
 
 **Key data structures:**
 - `GlobalAddress {node_id, region_id, offset}` — 14-byte wire format
-- `MemoryRegion {gaddr, local_addr, length, rkey, lkey, flags}` — registered RDMA region
-- `MemoryCatalog` — replicated directory of all cluster regions, each node exposes its catalog at a well-known RDMA-addressable buffer
+- `MemoryRegion {gaddr, local_addr, length, flags}` — registered region (no rkey/lkey on macOS; the peer's local table is the access control)
+- `MemoryCatalog` — replicated directory of all cluster regions
 
 **Key API:**
 ```cpp
@@ -46,26 +66,21 @@ uint64_t get(uint16_t target, GlobalAddress src, void* dst, uint64_t len);
 uint64_t put_with_imm(uint16_t target, GlobalAddress dst, const void* src, uint64_t len, uint32_t imm);
 ```
 
-**RdmaConnection extensions** (added to existing class):
-```cpp
-bool post_rdma_write(ibv_sge& sge, uint64_t remote_addr, uint32_t rkey, uint64_t wr_id);
-bool post_rdma_read(ibv_sge& sge, uint64_t remote_addr, uint32_t rkey, uint64_t wr_id);
-bool post_rdma_write_with_imm(ibv_sge& sge, uint64_t remote_addr, uint32_t rkey, uint32_t imm, uint64_t wr_id);
-```
+**Zero-copy path:** `extract_mps_buffer()` → shared-storage `cpu_ptr` → fed directly into `send(2)` / `recv(2)`. No staging buffer between socket and GPU memory because there is no separate GPU memory. Private-storage MTLBuffers (rare in this codebase) still need a blit; avoid them.
 
-**Zero-copy path:** `extract_mps_buffer()` → `cpu_ptr` (shared storage) → `ibv_reg_mr(pd, cpu_ptr, nbytes, LOCAL_WRITE|REMOTE_READ|REMOTE_WRITE)` → NIC DMA directly to/from GPU memory. Private storage still needs a staging blit.
+**Multi-cable striping:** the transport opens **K sockets per peer**, one per TB `/24` between the two nodes. Bulk transfers are chunked across the K sockets. K=2 today (two TB cables per pair), expandable to K=3 once the spare `en4` ports are wired.
 
-**Threading:** Dedicated CQ poller thread dispatches completions. One QP per peer, RC transport.
+**Threading:** dedicated completion-poller thread per peer connection (or one `kqueue` thread fanning out to all peers — TBD by benchmarking). Pin to a P-core via QoS class `USER_INTERACTIVE`.
 
 ---
 
 ## Layer 2: Coherence Protocol
 
-**Release consistency** on top of a **directory-based** protocol. Home node = the node that allocated the memory. 64KB coherence granules (16 RDMA MTUs, efficient directory overhead).
+**Release consistency** on top of a **directory-based** protocol. Home node = the node that allocated the memory. 64 KB coherence granules (4× Apple Silicon page size, efficient directory overhead).
 
-**States per page:** UNCACHED → SHARED (readers exist) → EXCLUSIVE (one writer)
+**States per granule:** UNCACHED → SHARED (readers exist) → EXCLUSIVE (one writer)
 
-**Protocol messages** delivered via `put_with_imm()` to well-known per-node message buffers:
+**Protocol messages** delivered as small framed TCP writes to a well-known per-node control socket:
 - `READ_REQ` / `READ_REPLY` — acquire a readable copy
 - `EXCLUSIVE_REQ` / `EXCLUSIVE_GRANT` — acquire write permission
 - `INVALIDATE` / `INVAL_ACK` — force sharers to discard on write
@@ -77,24 +92,24 @@ void acquire(uint64_t epoch);            // ensure all prior remote writes visib
 void release();                          // flush local writes before others read
 void fence();                            // full memory fence
 void barrier_all();                      // cluster-wide sync point
-void read_page(GlobalAddress, bool write); // coherence-managed page fetch
-void gpu_acquire(id<MTLCommandBuffer>, uint64_t epoch);  // encode MTLSharedEvent wait
-void gpu_release(id<MTLCommandBuffer>, uint64_t epoch);  // encode MTLSharedEvent signal
+void read_page(GlobalAddress, bool write); // coherence-managed granule fetch
+void gpu_acquire(id<MTLCommandBuffer>, uint64_t epoch);  // encode MTLSharedEvent wait, intra-node
+void gpu_release(id<MTLCommandBuffer>, uint64_t epoch);  // encode MTLSharedEvent signal, intra-node
 ```
 
-**GPU integration:** `gpu_acquire()` encodes `encodeWaitForEvent` on the command buffer before shader execution. `gpu_release()` encodes `encodeSignalEvent` after writes. Coherence poller thread monitors `signaledValue`, triggers writeback for dirty exclusive pages.
+**GPU integration:** `gpu_acquire()` / `gpu_release()` encode `encodeWaitForEvent` / `encodeSignalEvent` on the local command buffer to order shader execution against the *local* network completion. Cross-node ordering is provided by the protocol messages themselves (TCP delivers in order on each socket, and the directory mutex serializes transitions at the home node).
 
-**Ordering:** RDMA RC guarantees prior ops complete before subsequent ones on the same QP. Directory mutex serializes all transitions at the home node. Directory lock never held across network ops (deadlock-free).
+**Ordering:** TCP guarantees in-order delivery per socket. With K sockets per peer, ordering is preserved by binding each granule to a deterministic socket (e.g. `socket = hash(region_id, offset) mod K`). Directory lock never held across network ops (deadlock-free).
 
 ---
 
 ## Layer 3: Distributed Metal Runtime
 
-Presents a single logical MTLDevice. Each node compiles the same metallib locally. The runtime coordinates which shader runs on which data shard.
+Presents a single logical MTLDevice abstraction over N physical devices (one per node). Each node compiles the same metallib locally. The runtime coordinates which shader runs on which data shard.
 
 **Two execution models:**
-1. **Data-parallel:** each node runs the same shader on its grid partition. Before dispatch: `gpu_acquire()` on remote input buffers. After dispatch: `gpu_release()` on output buffers. `barrier_all()` at end.
-2. **Pipeline-parallel:** nodes form a pipeline with RDMA transfers between stages. Double-buffered: one transfer overlaps with computation. Warm-up → steady-state → cool-down.
+1. **Data-parallel:** each node runs the same shader on its grid partition. Before dispatch: `gpu_acquire()` on remote input buffers (after coherence has fetched them). After dispatch: `gpu_release()` on output buffers. `barrier_all()` at end.
+2. **Pipeline-parallel:** nodes form a pipeline with TB-TCP transfers between stages. Double-buffered: one transfer overlaps with computation. Warm-up → steady-state → cool-down.
 
 **Key API:**
 ```cpp
@@ -104,21 +119,23 @@ void dispatch_data_parallel(ShaderDispatch& dispatch, ResourceBindFn bind);
 void dispatch_pipeline_parallel(vector<PipelineStage>& stages, int num_micro_batches);
 ```
 
-**Threading:** Dispatch calls are blocking. Transfer pool (2 threads) handles RDMA between pipeline stages.
+**Note on tensor-parallel:** the network ceiling (~3 GB/s per cable, ~6 GB/s per peer with 2 cables striped) means cross-node tensor-parallel matmul is only viable for small hidden dims or with aggressive overlap. This plan supports it but does not optimize for it; DP / ZeRO / PP are the realistic regimes on this hardware.
+
+**Threading:** dispatch calls are blocking. Transfer pool sized to K-sockets-per-peer for pipeline stage transfers.
 
 ---
 
 ## Layer 4: Tensor Runtime (Python)
 
-User-facing API. `DistributedTensor` wraps a local tensor shard + its DMEM global address. No collectives — gradient sync is N-1 independent RDMA writes per node.
+User-facing API. `DistributedTensor` wraps a local tensor shard + its DMEM global address. Gradient sync is N-1 independent TCP-over-TB writes per node — no MPI-style collective state machine, just point-to-point sends fanned out.
 
 ```python
 class DistributedTensor:
     def __init__(self, local_tensor, sharding, shard_index, num_shards, global_shape, dtype)
-    def sync_gradient(self)      # RDMA put() to each peer's gradient buffer
-    def all_reduce(self, op)     # direct RDMA writes, no MPI collectives
-    def all_gather(self)         # RDMA read from every peer
-    def reduce_scatter(self)     # RDMA read + local accumulate
+    def sync_gradient(self)      # put() to each peer's gradient buffer
+    def all_reduce(self, op)     # direct point-to-point writes, no collective FSM
+    def all_gather(self)         # peer get()s
+    def reduce_scatter(self)     # peer get() + local accumulate
 
 class ModelParallelPlan:
     def data_parallel_split(tensor, dim)    # chunk along batch dim
@@ -126,18 +143,20 @@ class ModelParallelPlan:
     def pipeline_parallel_split(layers)     # assign layers to stages
 ```
 
-Distributed training loop: forward → backward → `sync_gradient()` (RDMA writes) → optimizer.step(). No allreduce collective.
+Distributed training loop: forward → backward → `sync_gradient()` → optimizer.step().
+
+**Wire-format optimization:** dtype policy allows bf16-on-the-wire even when local accumulators are fp32. M4 GPUs do bf16 natively; the cast is a single trivial shader. Halves bytes-on-wire for gradient sync.
 
 ---
 
 ## Layer 5: Cluster Manager
 
-Daemon per node. TCP control channel for membership, heartbeats, catalog sync, job submission. RDMA for data.
+Daemon per node. **Tailscale `100.x` TCP** for control channel (membership, heartbeats, catalog sync, job submission). **TB-bridge TCP** for data only.
 
 **Components:**
-- **Membership:** leader election (lowest node_id), 500ms heartbeats, 3-miss detection (~1.5s)
+- **Membership:** leader election (lowest node_id), 500 ms heartbeats over Tailscale, 3-miss detection (~1.5 s)
 - **Region registry:** replicated catalog of all DMEM regions
-- **Scheduler** (leader): priority queue + fair-share, 1s tick interval. Supports preemption.
+- **Scheduler** (leader): priority queue + fair-share, 1 s tick interval. Supports preemption.
 - **Fault tolerance:** on node failure, catalog rebuild + job rescheduling on remaining nodes
 
 **Key API:**
@@ -148,7 +167,7 @@ void schedule_tick();
 void handle_node_failure(uint16_t node_id);
 ```
 
-**Threads:** control listener, heartbeat sender, scheduler tick (leader only).
+**Threads:** control listener (Tailscale fd), heartbeat sender, scheduler tick (leader only).
 
 ---
 
@@ -175,16 +194,14 @@ csrc/
 │   ├── Metrics.{hpp,cpp}            (survives)
 │   └── MemoryPool.{hpp,cpp}         (survives)
 ├── python/
-│   └── bindings.cpp                 (pybind11, replaces old Registration.cpp)
-├── transport/rdma/                  (survives, extended)
-│   ├── RdmaConnection.{hpp,cpp}     (extended: one-sided ops)
-│   ├── RdmaTransport.{hpp,cpp}
+│   └── bindings.cpp                 (pybind11)
+├── transport/onesided/              (formerly transport/rdma/, rewritten as TCP-over-TB)
+│   ├── PeerLink.{hpp,cpp}           (K sockets per peer, striping)
 │   ├── SharedBuffer.{hpp,cpp}
-│   ├── IbvWrapper.{hpp,cpp}
-│   └── ibverbs_compat.h
-├── metal/                           (survives, stripped)
+│   └── Framing.{hpp,cpp}
+├── metal/
 │   ├── MPSInterop.{hpp,mm}
-│   ├── EventSync.{hpp,mm}           (extended: cross-node coherence)
+│   ├── EventSync.{hpp,mm}           (intra-node only)
 │   ├── MetalKernels.{hpp,mm}
 │   └── shaders.metal
 └── common/
@@ -207,23 +224,26 @@ mccl/
 
 ## Implementation Sequence
 
-**Phase 1 — DMEM (foundation):** Extend RdmaConnection with one-sided ops → DistributedMemoryManager (register, put, get, catalog) → CQ poller thread → two-node 1GB RDMA READ/WRITE test.
+**Phase 0 — Transport foundation:** PeerLink with K sockets per peer over the existing TB `/24`s; chunked striped send/recv; P-core QoS for the I/O thread; large SO_SNDBUF/RCVBUF; TCP_NODELAY. Bench point-to-point throughput; verify ≥ 5 GB/s with K=2.
 
-**Phase 2 — Coherence:** CoherenceDirectory + state tracking → message protocol via put_with_imm → acquire/release/fence/barrier_all → MTLSharedEvent integration → coherence stress test.
+**Phase 1 — DMEM:** DistributedMemoryManager (register, put, get, catalog) on top of PeerLink → completion-poller thread → two-node 1 GB cross-put / cross-get test.
 
-**Phase 3 — Distributed Runtime:** ShaderDispatch + dispatch_data_parallel → RDMA tensor transfer → dispatch_pipeline_parallel with micro-batching → correctness test (distributed matmul across 3 nodes).
+**Phase 2 — Coherence:** CoherenceDirectory + state tracking → message protocol → acquire/release/fence/barrier_all → MTLSharedEvent integration (intra-node) → coherence stress test.
 
-**Phase 4 — Tensor Runtime:** DistributedTensor + DMEM registration → sync_gradient via put() → all_reduce/all_gather/reduce_scatter via DMEM → ModelParallelPlan → convergence test (training loop).
+**Phase 3 — Distributed Runtime:** ShaderDispatch + dispatch_data_parallel → tensor transfer via DMEM → dispatch_pipeline_parallel with micro-batching → correctness test (distributed matmul across 3 nodes).
 
-**Phase 5 — Cluster Manager:** TCP control channel + heartbeats → membership + leader election → job scheduler → fault tolerance (kill a node, verify recovery).
+**Phase 4 — Tensor Runtime:** DistributedTensor + DMEM registration → sync_gradient via put() → all_reduce / all_gather / reduce_scatter → bf16-on-the-wire policy → ModelParallelPlan → convergence test (training loop).
+
+**Phase 5 — Cluster Manager:** Tailscale control channel + heartbeats → membership + leader election → job scheduler → fault tolerance (kill a node, verify recovery).
 
 ---
 
 ## Verification
 
-1. **DMEM:** Two nodes, register 1GB MTLBuffer on each, cross-put and cross-get, verify data integrity with checksums
-2. **Coherence:** Three nodes, concurrent read/write patterns to same page, verify directory state machine correctness via assertions on epoch ordering
-3. **Distributed Runtime:** Data-parallel matrix multiply across 3 nodes, compare output to single-node reference (bit-exact for fp32)
-4. **Tensor Runtime:** Full training loop with a known model on known data, verify loss curve matches single-node reference within numerical tolerance
-5. **Cluster Manager:** Kill node 2 mid-job, verify job continues on nodes 0 and 1 with correct gradient sync for 2-way
-6. **End-to-end:** `torchrun --nnodes=3 --nproc_per_node=1 train.py` with distributed sharding, measure throughput scaling vs single node
+1. **Transport:** Two nodes, K=2 sockets per peer over two TB cables, sustain ≥ 5 GB/s on a 10 GB transfer.
+2. **DMEM:** Two nodes, register 1 GB MTLBuffer on each, cross-put and cross-get, verify data integrity with checksums.
+3. **Coherence:** Three nodes, concurrent read/write patterns to same granule, verify directory state machine correctness via assertions on epoch ordering.
+4. **Distributed Runtime:** Data-parallel matrix multiply across 3 nodes, compare output to single-node reference (bit-exact for fp32).
+5. **Tensor Runtime:** Full training loop with a known model on known data, verify loss curve matches single-node reference within numerical tolerance.
+6. **Cluster Manager:** Kill node 2 mid-job, verify job continues on nodes 0 and 1 with correct gradient sync for 2-way.
+7. **End-to-end:** `torchrun --nnodes=3 --nproc_per_node=1 train.py` with distributed sharding, measure throughput scaling vs single node.

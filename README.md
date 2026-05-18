@@ -1,147 +1,90 @@
-# MCCL
+# mccl
 
-`mccl` registers an `mccl` backend for `torch.distributed` on Apple Silicon, designed for clusters of Mac minis connected by Thunderbolt.
+`mccl` is a `torch.distributed` backend for Apple Silicon clusters of Mac minis connected over Thunderbolt. It works with stock `torchrun` / `DistributedDataParallel`; the only change is `backend="mccl"`.
 
 ## Hardware
 
-- **Required: Thunderbolt cables between every pair of machines.** Data-plane bandwidth is ~3 GB/s per TB link vs ~100 MB/s over WiFi/LAN. The backend will fall through to non-TB paths if asked to, but training perf collapses by 30×.
-- **Recommended: Tailscale** on each machine. Used only as a control plane — rendezvous, barriers, SSH — and gives you a uniform `100.x.x.x` address per node regardless of LAN topology. Free, easy, takes ~2 min per node.
-- Apple Silicon (arm64). Python ≥ 3.11.
+- **Thunderbolt cables between every pair of nodes.** mccl refuses non-TB interfaces by default (hard-filter on `MCCL_IFACE_PRIORITY` subnets). A single TB4 cable carries ~4.2 GB/s of TCP throughput.
+- **Tailscale on each node** for control-plane / SSH. Data plane is TB only.
+- Apple Silicon (arm64). Python ≥ 3.11. PyTorch ≥ 2.5 (2.12 tested).
 
 ## Setup
 
-On every machine:
-
-1. **Tailscale** (recommended). Install from https://tailscale.com/download/macos, sign in, confirm with `tailscale status`.
-2. **Thunderbolt Bridge IPs**. Plug TB cables to your peers, then System Settings → Network → Thunderbolt Bridge (or each individual TB port) → Manually → assign a `/24` per pair, e.g. the first cable on `192.168.101.0/24`, the second on `192.168.102.0/24`. Apply, repeat on each end.
-3. **Xcode CLI tools**: `xcode-select --install`.
-4. **Install mccl**:
+1. **Thunderbolt Bridge IPs.** Cable each pair of machines, then System Settings → Network → Thunderbolt Bridge → assign a `/24` per peer pair. The defaults `mccl` looks for are `192.168.101.0/24`, `192.168.102.0/24`, `192.168.103.0/24`.
+2. **Xcode CLI tools**: `xcode-select --install`.
+3. **Install**:
    ```bash
-   pip install torch>=2.5
-   pip install -e .          # from source
-   # or:  pip install mccl   # once published
+   pip install torch
+   pip install -e .
    ```
-5. **Verify**:
+4. **Verify**:
    ```bash
    mccl --check
    ```
-   Exits 0 if platform / Python / Xcode CLI / extension / Thunderbolt IPs are all OK. Tailscale and peer reachability are advisory. Set `MCCL_PEERS=192.168.102.1,192.168.103.1` to also ping peer TB IPs.
 
-## Run
+## Usage
 
-```bash
-# single-host smoke
-mccl --test                           # unit + integration via mp.spawn
+```python
+import mccl                  # MUST import before torch (see Performance notes)
+import torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# multi-host bench (one command per machine)
-RANK=$N WORLD_SIZE=3 MASTER_ADDR=<rank0-tb-ip> MASTER_PORT=29500 \
-  python tests/multinode/bench.py --rank $N --world 3 --master <rank0-tb-ip>
+dist.init_process_group(backend="mccl", device_id=torch.device("mps:0"))
+model = DDP(MyModel().to("mps:0"))
+# ...train as usual
 ```
 
-Demo: https://github.com/user-attachments/assets/21865149-b077-4b65-93cc-f9e319ff0328
+Launch per node:
+```bash
+RANK=$N WORLD_SIZE=3 MASTER_ADDR=<rank0-ip> MASTER_PORT=29500 python train.py
+```
 
 ## Performance
 
-**M4 Max** + **M1 Max**, TCP over Thunderbolt, global batch **256**, ~**96.5M** params — **~78** samples/s single-GPU vs **~134** samples/s MCCL DDP (2 ranks). Details and reproduce commands in [Throughput](#throughput) below.
+Measured on a 3× Mac mini (M4, 16 GB) cluster, full TB triangle, **70M-param decoder-only transformer**, batch=16, seq=256, bf16-on-wire, butterfly allreduce.
 
-![bench](bench.png)  
-![bars](bench_bars.png)
+| Config | Samples/s | Speedup |
+|---|---|---|
+| Single mini | 22.1 | 1.00× |
+| 3 minis, ring allreduce | 54.1 | 2.44× |
+| **3 minis, butterfly allreduce + bf16 wire** | **56.9** | **2.58×** |
 
-## Examples
+Stable across 3 consecutive runs (variance < 1 %). The remaining gap to 3× is hardware-bound: each peer pair has one TB cable, capping comm at 4.2 GB/s; the theoretical ceiling is ~2.7×.
 
-```bash
-python examples/ddp_dummy_train.py --baseline
-torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 \
-  examples/ddp_dummy_train.py
-```
+110M-param transformer (batch=16): single mini 14.8 → 3-mini 35.9 = **2.43×**.
 
-Defaults there: DDP `BATCH_SIZE=128` per rank → global 256 with 2 ranks; baseline path uses global 256 unless you override. Shrink batch if you OOM.
+## Tunables
 
-Minimal DDP script (use `torchrun` as below). **Several Macs:** same pattern, `--nproc_per_node=1`, matching `--nnodes` / `--node_rank`, shared **`MASTER_ADDR`** / **`MASTER_PORT`**. Checklist: [docs/MULTINODE.md](docs/MULTINODE.md).
-
-```python
-import os
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import mccl
-
-def main():
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    device = torch.device("mps:0")
-
-    dist.init_process_group(backend="mccl", device_id=device)
-
-    torch.manual_seed(42)
-    model = nn.Sequential(nn.Linear(512, 256), nn.ReLU(), nn.Linear(256, 10)).to(device)
-    ddp_model = DDP(model)
-    optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
-    loss_fn = nn.CrossEntropyLoss()
-
-    for step in range(10):
-        x = torch.randn(8, 512, device=device)
-        y = torch.randint(0, 10, (8,), device=device)
-        optimizer.zero_grad(set_to_none=True)
-        loss_fn(ddp_model(x), y).backward()
-        optimizer.step()
-        if rank == 0:
-            print(step, "ok")
-
-    dist.destroy_process_group()
-
-if __name__ == "__main__":
-    main()
-```
-
-```bash
-torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 your_train.py
-```
-
-## Throughput
-
-One saved run, **M4 Max** + **M1 Max** MBPs, TCP over TB, global batch **256**, ~**96.5M** params. Your numbers will differ.
-
-```
-single M1 Max (MPS):   78.3 samples/s   (global_batch=256, world=1)
-DDP (MCCL):          134.2 samples/s   (global_batch=256, world=2)
-baseline / DDP:      0.58×  (~172% DDP vs baseline)
-```
-
-Tiny batches = comm noise dominates. Different chips on each rank = slowest one paces the step.
-
-```bash
-python examples/ddp_dummy_train.py --baseline --save-stats baseline_stats.json
-torchrun --nproc_per_node=2 --nnodes=1 --master_addr=127.0.0.1 --master_port=29500 \
-  examples/ddp_dummy_train.py --save-stats ddp_stats.json
-python examples/benchmark_throughput.py --baseline baseline_stats.json --ddp ddp_stats.json -o bench
-```
-
-`bash scripts/benchmark_matrix.sh` for more sweeps.
-
+| Env var | Default | Purpose |
+|---|---|---|
+| `MCCL_IFACE_PRIORITY` | `192.168.101.,192.168.102.,192.168.103.` | TB subnet priority. Hard-filtered — non-priority IPs refused. |
+| `MCCL_ALLREDUCE_ALGO` | `auto` | `ring`, `tree`, `butterfly`, or `auto` (tree below 256 KB else ring). `butterfly` is fastest on full TB mesh, N ≤ 4. |
+| `MCCL_TREE_BELOW` | `262144` | Byte threshold below which `auto` picks tree over ring. |
+| `MCCL_WIRE_DTYPE` | unset | Set to `bf16` to compress fp32 wire payloads (halves bandwidth, marginal accuracy hit). |
+| `PYTORCH_MPS_TRACE_SIGNPOSTS` | auto-set to `1` | Disables torch's `commitAndContinue` to avoid an MPS race during DDP backward. mccl sets this on import (must precede `import torch`). |
 
 ## Collectives
 
-`allreduce`, `broadcast`, `barrier`, `allgather`, `reduce_scatter`, `send`, `recv`
+`allreduce` (ring / tree / butterfly) · `broadcast` · `barrier` · `allgather` · `reduce_scatter` · `alltoall` · `send` / `recv`
 
-## Diagnostics
+## Parallelism support
 
-```python
-mccl.get_metrics(); mccl.log_metrics(); mccl.reset_metrics()
-```
+mccl exposes the c10d primitives every PyTorch parallelism strategy needs. Status of each at scale on 3-mini cluster:
 
-Verbose startup: `MCCL_LOG_LEVEL=INFO`. Stuck multi-node: [docs/MULTINODE.md](docs/MULTINODE.md).
+- **Data parallel (DDP)** — verified end-to-end (2.58× at 70M, 2.43× at 110M).
+- **Pipeline parallel** — verified via `dist.send`/`dist.recv` between stages.
+- **Tensor parallel** — primitives verified; `torch.distributed.tensor.parallel.DeviceMesh("mps", …)` is broken in torch 2.12 (missing `torch.mps.is_initialized`), so hand-wired col/row parallel works but the high-level API does not.
+- **FSDP / ZeRO-3** — primitives present (allgather + reduce_scatter pass unit tests) but torch's FSDP itself is **not yet wired to MPS** (`UntypedStorage.resize_: got unexpected device type mps`). This is an upstream torch limitation, not mccl.
 
-## Transport
+## Upstream PyTorch patch
 
-Bench plots were TCP over a Thunderbolt-style link, not RDMA. Wi‑Fi/Ethernet work, just slower. TB wiring: [docs/THUNDERBOLT_SETUP.md](docs/THUNDERBOLT_SETUP.md). RDMA path exists on TB5-capable hardware + `librdma.dylib`; `rdma_ctl enable` from Recovery once; we didn’t use that for the graphs above.
+Optional but recommended: `patches/pytorch/0001-MPSStream-flush-defensive-status-check.patch`. Fixes a torch MPS race that mccl's async overlap path triggers under DDP. mccl ships with inline-sync allreduce so the patch isn't required for the steady 2.58× number above; apply it only if you want to experiment with async overlap.
 
 ## Internals
 
-On Apple Silicon, **CPU and GPU use the same physical RAM** (unified memory architecture, **UMA**). Many MPS tensors sit in Metal **`MTLBuffer`** storage marked **shared**: the CPU can take a pointer (`buffer.contents`, see `extract_mps_buffer` in `MPSInterop.mm`) into the **same bytes** the GPU is using. MCCL uses that for send staging, receive `memcpy`, and **Accelerate/vDSP** work in `AccelerateOps.mm` without allocating a second host copy. For **fp32** + shared storage, ring **allreduce** **accumulates in place** into the tensor slice: inbound chunks hit a small recv buffer, then **vDSP** (`AccelerateOps.mm`) folds them into the **same** `cpu_ptr` the GPU uses, not a second full host tensor. **Private** GPU storage uses staging blits (`chunked_blit_*`) and **Metal** for the reduce path instead.
+Apple Silicon **UMA** means CPU and GPU share physical RAM. `MTLBuffer` (shared storage) gives a CPU pointer that aliases GPU memory — `extract_mps_buffer` (`csrc/metal/MPSInterop.mm`) hands that pointer to `send(2)`/`recv(2)` directly, no staging copy.
 
-Network and staging run on a **background queue** (`ProgressEngine`, `csrc/runtime/`). **`commit_mps_and_signal`** / **`wait_for_mps`** (`EventSync.mm`) wait on a **Metal shared event** tied to PyTorch’s MPS command buffer so the worker does not read tensor memory while the GPU is still writing. `MCCL_EVENT_SYNC=0` disables that path and uses a stream sync instead. `ProcessGroupMCCL.cpp` wires jobs into the engine. More detail: [docs/DEVELOPING.md](docs/DEVELOPING.md).
+mccl's ring & butterfly allreduce reduce in place into the tensor slice via Metal kernels (`csrc/metal/MetalKernels.mm`), drained on a per-PG MTL queue. The Progress engine handles other collectives async; allreduce is intentionally inline-sync to avoid a torch MPS commit race.
 
 ## License
 
