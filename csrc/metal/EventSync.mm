@@ -101,21 +101,14 @@ void commit_mps_and_signal(uint64_t value) {
     EventState& s = state();
     DISTRO_CHECK(s.initialized, "EventSync not initialized");
 
-    // Encode a signal on torch's active command buffer but DO NOT commit.
-    // Torch will commit the buffer naturally on its next sync point (its
-    // own backward ops or a synchronize() at end of backward). At that
-    // point our signal fires and the engine thread proceeds.
-    //
-    // Why not commit ourselves: torch may still be encoding ops on this
-    // buffer (DDP fires reducer hooks mid-backward while MPSGraph is
-    // running on the buffer in parallel). Committing here aborts torch's
-    // in-flight encoding ("command buffer already committed").
-    dispatch_sync(
-        (dispatch_queue_t)torch::mps::get_dispatch_queue(), ^{
-            id<MTLCommandBuffer> cmd =
-                (id<MTLCommandBuffer>)torch::mps::get_command_buffer();
-            [cmd encodeSignalEvent:s.mps_event value:value];
-        });
+    // No-op. The async path (encodeSignalEvent or addCompletedHandler
+    // on torch's command buffer, called from another thread while
+    // MPSGraph is mid-encode in DDP backward) races and trips
+    // `MPSPredicate: command buffer already committed`. Allreduce
+    // currently runs inline-sync; this entry point stays as a hook
+    // for a future overlap path that doesn't touch torch's command
+    // buffer cross-thread.
+    s.mps_event.signaledValue = value;
 }
 
 void wait_for_mps(uint64_t value) {

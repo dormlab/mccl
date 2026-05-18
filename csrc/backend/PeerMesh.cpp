@@ -1,5 +1,6 @@
 #include "backend/PeerMesh.hpp"
 #include "common/Errors.hpp"
+#include "common/Logging.hpp"
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -265,6 +266,8 @@ PeerMesh::PeerMesh(c10::intrusive_ptr<c10d::Store> store,
                 setsockopt(s_fd, SOL_SOCKET, SO_SNDTIMEO, &zero, sizeof(zero));
                 tune(s_fd);
                 fd = s_fd;
+                DISTRO_INFO("PeerMesh: rank %d -> peer %d via %s:%d",
+                            rank_, p, ip.c_str(), peer_port);
                 break;
             }
             if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));

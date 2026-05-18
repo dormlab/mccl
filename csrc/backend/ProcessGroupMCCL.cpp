@@ -164,19 +164,18 @@ c10::intrusive_ptr<c10d::Work> ProcessGroupMCCL::allreduce(
         work_tensors.push_back(std::move(wt));
     }
 
-    // Synchronous execution. Async via Metal shared events triggers
-    // MPSPredicate panics when DDP fires reducer hooks while torch's
-    // autograd is still encoding ops on the same MPS command buffer.
-    // True comm/compute overlap requires either an upstream torch fix or
-    // a PyTorch comm_hook that runs the allreduce strictly outside of
-    // backward — left as future work.
+    // Synchronous. Async overlap requires touching torch's MPS state
+    // (get_command_buffer + addCompletedHandler / encodeSignalEvent)
+    // from a non-encoding thread; that races with MPSGraph mid-encode
+    // during DDP backward and trips MPSPredicate. Tried both
+    // encodeSignalEvent and addCompletedHandler — same panic. Real
+    // overlap needs an upstream torch/MPS fix.
     mps_stream_sync();
     for (size_t i = 0; i < argv.size(); ++i) {
         if (algv[i] == "ring") allreduce_ring(argv[i], op, rank, world, mesh);
         else                    allreduce_tree(argv[i], op, rank, world, mesh);
     }
     mccl_queue_drain();
-    // Cast bf16 work tensors back into the caller's fp32 buffer.
     for (size_t i = 0; i < tensors.size(); ++i) {
         if (work_tensors[i].data_ptr() != tensors[i].data_ptr()) {
             tensors[i].copy_(work_tensors[i].to(tensors[i].scalar_type()));
